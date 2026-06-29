@@ -1,0 +1,51 @@
+{
+  "errors": null,
+  "timestamp": "2026-06-28T16:27:02+03:00",
+  "visits": {
+    "20004": [
+      {
+        "producer": "SIRI",
+        "timestamp": "2026-06-28 16:26:29+03:00",
+        "stop_code": "20004",
+        "line_name": "47",
+        "eta": "2026-06-28 16:28:00+03:00",
+        "static_info": {
+          "route": {
+            "destination": {
+              "name": {
+                "EN": "Ra'anana Terminal/HaPnina",
+                "HE": "מסוף רעננה/הפנינה"
+              }
+            },
+            "agency": {
+              "name": {
+                "EN": "Metropoline"
+              }
+            }
+          }
+        }
+      },
+      {
+        "producer": "SIRI",
+        "timestamp": "2026-06-28 16:26:29+03:00",
+        "stop_code": "20004",
+        "line_name": "501",
+        "eta": "2026-06-28 16:31:00+03:00",
+        "static_info": {
+          "route": {
+            "destination": {
+              "name": {
+                "EN": "Ra'anana Terminal/HaSharon Road"
+              }
+            },
+            "agency": {
+              "name": {
+                "EN": "Metropoline"
+              }
+            }
+          }
+        }
+      }
+    ]
+  }
+}

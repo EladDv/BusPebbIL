@@ -1,0 +1,14 @@
+[
+  {
+    "Shilut": "501",
+    "DestinationQuarterName": "Ra'anana Terminal Junction",
+    "CompanyName": "Metropoline",
+    "MinutesToArrivalList": [1, 14]
+  },
+  {
+    "Shilut": "271",
+    "DestinationQuarterName": "Tel Aviv-Yafo University",
+    "CompanyName": "Dan",
+    "MinutesToArrivalList": [3]
+  }
+]

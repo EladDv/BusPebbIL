@@ -1,0 +1,20 @@
+[
+  {
+    "Shilut": "89",
+    "DestinationQuarterName": "Holon Kiryat Sharet Terminal",
+    "CompanyName": "Dan",
+    "MinutesToArrivalList": [0, 30, 41]
+  },
+  {
+    "Shilut": "176",
+    "DestinationQuarterName": "Holon",
+    "CompanyName": "Superbus",
+    "MinutesToArrivalList": [1, 18, 38]
+  },
+  {
+    "Shilut": "173",
+    "DestinationQuarterName": "Rishon le-Tsiyon New Central Bus Station",
+    "CompanyName": "Superbus",
+    "MinutesToArrivalList": [2, 21, 42]
+  }
+]

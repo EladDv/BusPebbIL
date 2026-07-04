@@ -26,6 +26,8 @@ static char s_selected_stop_name[64];
 static uint8_t s_source;
 static int32_t s_updated_ago_sec;
 static int32_t s_refresh_sec = 30;
+static AppScreen s_arrivals_back_screen = ScreenHome;
+static MenuIndex s_arrivals_back_index = { .section = 0, .row = 0 };
 static char s_notice[64] = "Starting...";
 static NoticeKind s_notice_kind = NoticeInfo;
 static uint8_t s_tutorial_page;
@@ -401,6 +403,10 @@ static void request_arrivals(int32_t stop_code, const char *stop_name) {
   cancel_loading_timer();
   s_settings_syncing = false;
   s_apply_default_screen_on_settings = false;
+  if (s_screen != ScreenArrivals) {
+    s_arrivals_back_screen = s_screen;
+    s_arrivals_back_index = s_menu_layer ? menu_layer_get_selected_index(s_menu_layer) : (MenuIndex) { .section = 0, .row = 0 };
+  }
   s_selected_stop_code = stop_code;
   persist_write_int(PERSIST_LAST_STOP_CODE, stop_code);
   set_selected_stop_name(stop_code, stop_name);
@@ -627,10 +633,18 @@ static void back_click_handler(ClickRecognizerRef recognizer, void *context) {
     cancel_loading_timer();
     s_loading = false;
     s_settings_syncing = false;
-    s_screen = ScreenHome;
+    if (s_screen == ScreenArrivals &&
+        (s_arrivals_back_screen == ScreenNearby || s_arrivals_back_screen == ScreenStopCode)) {
+      s_screen = s_arrivals_back_screen;
+    } else {
+      s_screen = ScreenHome;
+    }
     ui_screens_restart_marquee(&s_ui);
     update_screen_notice();
     menu_layer_reload_data(s_menu_layer);
+    if (s_screen == s_arrivals_back_screen) {
+      menu_layer_set_selected_index(s_menu_layer, s_arrivals_back_index, MenuRowAlignCenter, false);
+    }
   } else {
     window_stack_pop(true);
   }

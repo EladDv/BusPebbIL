@@ -60,7 +60,8 @@ No backend or hosted settings service is required.
 | Stop code | Up / Down | Move between digits and the Open row. |
 | Stop code | Select on digit | Increment that digit. |
 | Stop code | Select / Long Select on Open row | Fetch arrivals for the entered stop code. |
-| Any sub-screen | Back | Return to Home. |
+| Arrivals | Back | Return to the screen that opened arrivals. |
+| Nearby / Stop code / Debug | Back | Return to Home. |
 
 ## Data Source
 

@@ -372,6 +372,7 @@ static const char *home_static_title_text(const char *title, int16_t width) {
 static const char *home_marquee_title_text(const char *title, int16_t width) {
   static char visible[72];
   GFont font = fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD);
+  if (ui_text_fits_width(title, font, width, HOME_TITLE_H)) return title;
   bool rtl = ui_text_is_rtl(title);
   size_t total = ui_text_utf8_char_count(title);
   uint8_t visible_chars = marquee_visible_chars(title, font, width, HOME_TITLE_H, rtl);

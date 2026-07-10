@@ -3,7 +3,7 @@
   "author": "Elad Dvash",
   "description": "Live Israeli bus arrivals for Pebble. View favorite stops, nearby stops, route destinations, and arrival minutes from your watch.",
   "license": "Apache-2.0",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "keywords": [
     "pebble-app"
   ],

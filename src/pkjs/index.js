@@ -41,6 +41,14 @@ function syncSettingsToWatch() {
   send(core.packStops(settings.favorite_stops || [], 5, MessageKeys, settings));
 }
 
+function refreshPhoneCache() {
+  core.refreshDailyTransitCache(null, settings).then(function() {
+    console.log('phone GTFS cache ready ' + JSON.stringify(core.getTransitCacheStatus(null)));
+  }).catch(function(error) {
+    console.log('phone GTFS cache refresh failed; keeping previous snapshot ' + JSON.stringify(error));
+  });
+}
+
 function requestArrivals(dict) {
   var defaultStopCode = (settings.favorite_stops && settings.favorite_stops[0]) ? settings.favorite_stops[0].code : 0;
   var stopCode = messageValue(dict, 'StopCode', null);
@@ -71,13 +79,13 @@ function requestNearby(dict) {
   navigator.geolocation.getCurrentPosition(function(position) {
     var lat = position.coords.latitude;
     var lon = position.coords.longitude;
-    core.fetchBusNearbyStops(lat, lon, radius, settings).catch(function(busNearbyError) {
-      console.log('busnearby nearby failed, falling back to OpenBus city index ' + JSON.stringify(busNearbyError));
-      return core.fetchStopIndexByCity(null, settings.nearby_city).then(function(index) {
-        return core.nearbyStops(index, lat, lon, radius);
-      });
-    }).then(function(stops) {
+    core.fetchBusNearbyStops(lat, lon, radius, settings).then(function(stops) {
       send(core.packStops(stops, 2, MessageKeys, settings));
+      core.warmNearbyTransitCache(null, stops, settings).then(function(status) {
+        console.log('nearby GTFS cache ready ' + JSON.stringify(status));
+      }).catch(function(error) {
+        console.log('nearby GTFS cache warm failed; keeping prior data ' + JSON.stringify(error));
+      });
     }).catch(function(error) {
       console.log('nearby stop request failed ' + JSON.stringify(error));
       sendError(11, 2);
@@ -102,14 +110,18 @@ function favoriteStop(dict) {
   var knownStop = { code: stopCode, name: 'Stop ' + stopCode };
   if (action < 0) {
     core.removeFavoriteStop(null, stopCode);
+    core.invalidateTransitCache(null);
     syncSettingsToWatch();
+    setTimeout(refreshPhoneCache, 0);
     return;
   }
   core.getStopByCode(stopCode).catch(function() {
     return knownStop;
   }).then(function(stop) {
     core.addFavoriteStop(null, stop);
+    core.invalidateTransitCache(null);
     syncSettingsToWatch();
+    setTimeout(refreshPhoneCache, 0);
   });
 }
 
@@ -119,8 +131,24 @@ function favoriteLine(dict) {
     sendError(21, 4);
     return;
   }
-  core.toggleFavoriteLine(null, line);
+  var stopCode = messageValue(dict, 'StopCode', 0);
+  var favoriteLines = core.toggleFavoriteLine(null, line);
   settings = core.parseSettings();
+  core.invalidateTransitCache(null);
+  var isFavorite = favoriteLines.some(function(favorite) {
+    return String(favorite.line) === String(line);
+  });
+  if (isFavorite && stopCode) {
+    core.getStopByCode(stopCode).then(function(stop) {
+      return core.warmNearbyTransitCache(null, [stop], settings);
+    }).then(function(status) {
+      console.log('favorite line GTFS cache ready ' + JSON.stringify(status));
+    }).catch(function(error) {
+      console.log('favorite line GTFS cache warm failed ' + JSON.stringify(error));
+    });
+  } else {
+    setTimeout(refreshPhoneCache, 0);
+  }
   var response = {};
   response[MessageKeys.ReqType] = 4;
   response[MessageKeys.Status] = 0;
@@ -128,7 +156,19 @@ function favoriteLine(dict) {
 }
 
 function requestDiagnostics() {
-  send(core.packDiagnostics(core.loadDiagnostics(null), MessageKeys));
+  send(core.packDiagnostics(core.loadDiagnostics(null), MessageKeys, core.getTransitCacheStatus(null)));
+}
+
+function requestRouteStops(dict) {
+  var routeRef = messageValue(dict, 'RouteRef', 0);
+  var stopCode = messageValue(dict, 'StopCode', 0);
+  var line = messageValue(dict, 'Line0', '');
+  core.getRouteStops(routeRef, stopCode, null, line).then(function(result) {
+    send(core.packRouteStops(result, MessageKeys));
+  }).catch(function(error) {
+    console.log('route stop request failed ' + JSON.stringify(error));
+    sendError(10, 7);
+  });
 }
 
 function handleMessage(event) {
@@ -142,6 +182,7 @@ function handleMessage(event) {
   else if (reqType === 4) favoriteLine(dict);
   else if (reqType === 5) syncSettingsToWatch();
   else if (reqType === 6) requestDiagnostics();
+  else if (reqType === 7) requestRouteStops(dict);
   else sendError(99, reqType);
 }
 
@@ -165,6 +206,15 @@ function applyConfigValues(values) {
   if (!values) return;
   values = core.normalizeConfigValues(values);
   settings = core.applyConfigValues(values);
+  var cacheInputsChanged = values.ClearCache === true || values.ClearCache === 'true' ||
+    !!values.FavoriteStopsJson || !!values.favorite_stops_json ||
+    !!values.ManualStopCode || !!values.manual_stop_code ||
+    !!values.FavoriteLinesJson || !!values.favorite_lines_json ||
+    !!values.FavoriteLinesCsv || !!values.favorite_lines_csv;
+  if (cacheInputsChanged) {
+    core.invalidateTransitCache(null);
+    setTimeout(refreshPhoneCache, 0);
+  }
   var manualStopCode = values.ManualStopCode || values.manual_stop_code;
   if (manualStopCode) {
     core.getStopByCode(manualStopCode).then(function(stop) {
@@ -198,9 +248,8 @@ function fallbackConfigUrl() {
     '<label>Vibrate under minutes<br><input id="vibrateUnderMin" value="', settings.vibrate_under_min, '" style="width:100%"></label><br>',
     '<label><input type="checkbox" id="darkMode"', settings.dark_mode ? ' checked' : '', '> Dark mode</label><br>',
     '<label><input type="checkbox" id="alertOnlyFavoriteLines"', settings.alert_only_favorite_lines ? ' checked' : '', '> Only favorite lines</label><br>',
-    '<label>Nearby city<br><input id="city" value="', settings.nearby_city, '" style="width:100%"></label><br>',
     '<button onclick="save()">Save</button>',
-    '<script>function save(){var data={FavoriteStopsJson:document.getElementById("stops").value,ManualStopCode:document.getElementById("manualStopCode").value,FavoriteLinesCsv:document.getElementById("lines").value,FavoriteLinesJson:document.getElementById("linesJson").value,MaxArrivals:document.getElementById("maxArrivals").value,VibrateUnderMin:document.getElementById("vibrateUnderMin").value,DarkMode:document.getElementById("darkMode").checked,AlertOnlyFavoriteLines:document.getElementById("alertOnlyFavoriteLines").checked,NearbyCity:document.getElementById("city").value};document.location="pebblejs://close#"+encodeURIComponent(JSON.stringify(data));}</script>',
+    '<script>function save(){var data={FavoriteStopsJson:document.getElementById("stops").value,ManualStopCode:document.getElementById("manualStopCode").value,FavoriteLinesCsv:document.getElementById("lines").value,FavoriteLinesJson:document.getElementById("linesJson").value,MaxArrivals:document.getElementById("maxArrivals").value,VibrateUnderMin:document.getElementById("vibrateUnderMin").value,DarkMode:document.getElementById("darkMode").checked,AlertOnlyFavoriteLines:document.getElementById("alertOnlyFavoriteLines").checked};document.location="pebblejs://close#"+encodeURIComponent(JSON.stringify(data));}</script>',
     '</body></html>'
   ].join('');
   return 'data:text/html,' + encodeURIComponent(html);
@@ -210,6 +259,7 @@ Pebble.addEventListener('ready', function() {
   console.log('BusPebbIL ready');
   settings = core.parseSettings();
   syncSettingsToWatch();
+  setTimeout(refreshPhoneCache, 0);
 });
 
 Pebble.addEventListener('appmessage', handleMessage);

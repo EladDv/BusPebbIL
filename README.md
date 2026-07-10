@@ -1,9 +1,9 @@
 # BusPebbIL
 
 BusPebbIL is an independent Pebble watch app for Israeli bus arrivals. The
-watch UI stays compact: favorite stops, nearby stops, arrival rows, manual
-refresh, and long-press favorite actions. PebbleKit JS on the paired phone owns
-live API calls, geolocation, settings, localStorage caches, normalization, and
+watch UI stays compact: favorite stops, nearby stops, arrival rows, automatic
+refresh, route-stop navigation, and long-press favorite actions. PebbleKit JS on the paired phone owns
+the realtime overlay, geolocation, settings, a daily local GTFS snapshot, normalization, and
 fallback behavior.
 
 No backend or hosted settings service is required.
@@ -15,13 +15,20 @@ No backend or hosted settings service is required.
   `HaMasger/Yad Harutsim`.
 - Manual stop-code add from Pebble app settings.
 - Watch-side manual stop-code picker for fallback lookups.
-- Nearby stop search using phone GPS, a city stop-index cache, bounding-box
-  filtering, and Haversine sorting.
-- Stop-index metadata cache recording city coverage, source, count, and expiry.
+- Daily atomic phone snapshot containing favorite-station schedules and
+  favorite/learned complete route patterns.
+- Nearby stop search using phone GPS and BusNearby. Results are shown first,
+  then their full-day schedules and complete line routes warm in the background.
 - Arrival rows packed as line, destination, minutes, delay, and flags.
+- Select an arrival to open its ordered route stops, focused on the originating
+  station; that station stays bold while scrolling the route.
+- Select any route station to open that station's arrivals. Back restores the
+  same route row, and Back again restores the original station and arrival row.
 - Honest source labels: `LIVE`, `SCHED`, or `CACHED`.
-- `bus.gov.il` live stop-arrival predictions first, with scheduled/cache
-  fallback when live rows are empty or unavailable.
+- Curlbus live stop-arrival predictions first. If live data is unavailable,
+  scheduled rows are served from the phone snapshot before any network fallback.
+- Route and stop lookups are local after first use; learned route patterns remain
+  complete even when they cross city boundaries.
 - Last-good arrival cache for network failure.
 - Short provider backoff for auth/rate-limit responses (`401`, `403`, `429`)
   so refreshes use cache instead of retrying immediately, with distinct
@@ -34,7 +41,7 @@ No backend or hosted settings service is required.
 - Clay settings for radius, refresh interval, language, default screen, max
   arrivals, manual stop-code add, favorite stop JSON, favorite line CSV,
   operator-capable favorite line JSON, display toggles, favorite-line-only
-  alerts, cache clearing, stop-index refresh, and debug mode.
+  alerts, cache clearing, and debug mode.
 - Long-select on nearby stops to favorite them.
 - Long-select on arrival rows to toggle favorite lines.
 - Favorite-line JSON can include an optional operator, for example
@@ -55,8 +62,12 @@ No backend or hosted settings service is required.
 | Nearby | Select | Open arrivals for the selected stop. |
 | Nearby | Long Select | Save the selected stop as a favorite. |
 | Arrivals | Up / Down | Move between arrival rows. |
-| Arrivals | Select | Refresh the current stop. |
+| Arrivals | Select | Open the selected line's ordered route stops. |
 | Arrivals | Long Select | Toggle the selected line as a favorite line. |
+| Route stops | Up / Down | Scroll through stations; the originating station remains bold. |
+| Route stops | Select | Open arrivals for the selected station. |
+| Route stops | Back | Return to the same selected arrival. |
+| Arrivals opened from route | Back | Return to the same route station. |
 | Stop code | Up / Down | Move between digits and the Open row. |
 | Stop code | Select on digit | Increment that digit. |
 | Stop code | Select / Long Select on Open row | Fetch arrivals for the entered stop code. |
@@ -65,25 +76,33 @@ No backend or hosted settings service is required.
 
 ## Data Source
 
-The app uses direct public transit endpoints from PebbleKit JS:
+The app refreshes a reduced, relevant GTFS snapshot at most once every 24 hours.
+This PBW-only cache intentionally stores the data BusPebbIL uses instead of the
+official nationwide archive, which is too large for PebbleKit JS localStorage.
 
-- `bus.gov.il` `GetRealtimeBusLineListByBustop` for primary live stop-arrival
-  predictions. This endpoint returned live Tel Aviv rows for stop `20004`.
-- OpenBus `/gtfs_stops/list` for stop lookup and stop-index chunks.
+The phone uses these direct public transit endpoints:
+
+- Curlbus's JSON API for primary live stop-arrival predictions.
+- OpenBus `/gtfs_stops/list` only for individual manual/favorite stop-code lookup.
 - OpenBus `/siri_stops/list` and `/siri_ride_stops/list` as a bounded
   secondary realtime candidate path.
-- OpenBus `/gtfs_ride_stops/list` as scheduled fallback with line and
-  destination data.
+- OpenBus `/gtfs_ride_stops/list` during daily favorite-station refresh,
+  nearby-mode warming, and when learning or refreshing a route.
+- OpenBus `/gtfs_ride_stops/list` also resolves a selected Curlbus route ref
+  into its ordered station sequence.
 - OpenBus `/stop_arrivals/list` is intentionally not used for the main row
   display because the currently observed response can be too sparse.
 
-For nearby stop discovery, the app first tries BusNearby's unauthenticated
-`/directions/index/stops` radius endpoint and falls back to the OpenBus city
-stop-index cache if that request fails. BusNearby stop-time and route endpoints
-are not used because they currently require a protected session token.
+Nearby stop discovery always uses BusNearby's unauthenticated
+`/directions/index/stops` radius endpoint. It does not download or persist a
+city-wide GTFS stop index. Once the nearby list is visible, OpenBus warms the
+relevant station schedules and deduplicated complete routes asynchronously.
+BusNearby stop-time and route endpoints are not used because they currently
+require a protected session token.
 
-When the OpenBus city stop-index fallback is refreshed, the app writes
-`stopindex:meta:v1` with the city, source, row count, saved time, and expiry.
+The atomic relevant-only snapshot is stored as `gtfsCache:snapshot:v2`; a failed
+daily update keeps the previous complete value. The old city-wide v1 snapshot
+is not carried forward, except for individually learned stations and routes.
 
 The app does not label scheduled fallback data as live.
 
@@ -95,15 +114,17 @@ npm test
 pebble build
 ```
 
-Optional network-backed live probe:
+Optional network-backed live probe (including first daily cache bootstrap and
+same-day snapshot reuse):
 
 ```sh
 npm run test:live
 ```
 
-This verifies bus.gov live rows for known stop codes and BusNearby's Tel Aviv
-nearby-stop response. It is intentionally separate from `npm test` because it
-depends on current public API availability.
+This verifies Curlbus live rows for known stop codes, a live route-ref-to-stop
+sequence lookup, and BusNearby's Tel Aviv nearby-stop response. It is
+intentionally separate from `npm test` because it depends on current public API
+availability.
 
 Optional emulator smoke matrix:
 
@@ -112,14 +133,15 @@ npm run test:emu
 ```
 
 This installs the current PBW into the Emery emulator, injects representative
-settings/arrival/error AppMessages, and writes screenshots to
+settings, arrival, route, and route-station AppMessages, verifies Back-stack
+navigation, and writes screenshots to
 `build/emulator-smoke/` for quick visual review.
 
 The latest local SDK is active on this machine:
 
 ```sh
 pebble --version
-# Pebble Tool v5.0.38 (active SDK: v4.17)
+# Pebble Tool v5.0.39 (active SDK: v4.17)
 ```
 
 The build artifact is:

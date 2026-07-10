@@ -6,8 +6,9 @@
       {
         "producer": "SIRI",
         "timestamp": "2026-06-28 16:26:29+03:00",
-        "stop_code": "20004",
-        "line_name": "47",
+      "stop_code": "20004",
+      "line_id": "7700",
+      "line_name": "47",
         "eta": "2026-06-28 16:28:00+03:00",
         "static_info": {
           "route": {

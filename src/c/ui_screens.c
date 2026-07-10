@@ -95,6 +95,7 @@ uint16_t ui_screens_get_num_rows_callback(MenuLayer *menu_layer, uint16_t sectio
   if (*ui->screen == ScreenHome) return home_normal_row_count(ui);
   if (*ui->screen == ScreenNearby) return *ui->nearby_count ? *ui->nearby_count : 1;
   if (*ui->screen == ScreenArrivals) return *ui->arrival_count ? *ui->arrival_count : 1;
+  if (*ui->screen == ScreenRouteStops) return *ui->route_stop_count ? *ui->route_stop_count : 1;
   if (*ui->screen == ScreenStopCode) return STOP_CODE_DIGITS + 1;
   if (*ui->screen == ScreenDebug) return *ui->debug_count ? *ui->debug_count : 1;
   return 1;
@@ -406,6 +407,8 @@ static const char *screen_title(BusPebbILUiState *ui) {
     return "Stop code";
   } else if (*ui->screen == ScreenDebug) {
     return "Debug";
+  } else if (*ui->screen == ScreenRouteStops) {
+    return ui->route_line[0] ? ui->route_line : "Route";
   }
   return ui->selected_stop_name;
 }
@@ -417,7 +420,8 @@ void ui_screens_draw_header_callback(GContext *ctx, const Layer *cell_layer, uin
   const char *title = screen_title(ui);
   graphics_context_set_fill_color(ctx, ui_color_paper());
   graphics_fill_rect(ctx, bounds, 0, GCornerNone);
-  graphics_context_set_fill_color(ctx, *ui->screen == ScreenArrivals ? ui_color_mint() : ui_color_blue());
+  graphics_context_set_fill_color(ctx, *ui->screen == ScreenArrivals ? ui_color_mint() :
+                                        (*ui->screen == ScreenRouteStops ? ui_color_orange() : ui_color_blue()));
   graphics_fill_rect(ctx, GRect(0, 0, 5, bounds.size.h), 0, GCornerNone);
   graphics_context_set_fill_color(ctx, ui_color_amber());
   graphics_fill_rect(ctx, GRect(5, bounds.size.h - 3, bounds.size.w - 5, 3), 0, GCornerNone);
@@ -610,7 +614,7 @@ static const char *tutorial_title(BusPebbILUiState *ui) {
   switch (*ui->tutorial_page) {
     case 0: return "Buttons";
     case 1: return "Select";
-    case 2: return "Refresh";
+    case 2: return "Routes";
     case 3: return "Favorites";
     case 4: return "Back";
     default: return "Done";
@@ -621,7 +625,7 @@ static const char *tutorial_body(BusPebbILUiState *ui) {
   switch (*ui->tutorial_page) {
     case 0: return "UP/DOWN moves between rows and between these guide pages.";
     case 1: return "SELECT opens the highlighted stop, Nearby, or Stop code row.";
-    case 2: return "On arrivals, SELECT refreshes the current stop.";
+    case 2: return "On arrivals, SELECT opens every stop on that line's route.";
     case 3: return "In Nearby, LONG SELECT saves a stop as a favorite.";
     case 4: return "On arrivals, LONG SELECT toggles that line as a favorite.";
     default: return "BACK returns to the previous screen. SELECT starts the app.";
@@ -697,6 +701,37 @@ static void draw_stop_row(BusPebbILUiState *ui, GContext *ctx, const Layer *cell
   draw_nav_row(ui, ctx, cell_layer, row, stop->name, meta, subtitle);
 }
 
+static void draw_route_stop_row(BusPebbILUiState *ui, GContext *ctx, const Layer *cell_layer,
+                                uint16_t row, RouteStopRow *stop) {
+  GRect bounds = layer_get_bounds(cell_layer);
+  bool highlighted = menu_cell_layer_is_highlighted(cell_layer);
+  bool is_current = row == *ui->route_current_index;
+  int16_t safe_inset = round_row_inset(ui, row);
+  int16_t left = 14 + safe_inset;
+  int16_t right = bounds.size.w - safe_inset;
+  draw_structured_row_base(ui, ctx, cell_layer, highlighted, safe_inset);
+
+  if (is_current) {
+    graphics_context_set_fill_color(ctx, ui_color_amber());
+    graphics_fill_rect(ctx, GRect(6 + safe_inset, 5, 5, bounds.size.h - 8), 0, GCornerNone);
+  }
+
+  static char sequence[8];
+  snprintf(sequence, sizeof(sequence), "%d", row + 1);
+  graphics_context_set_text_color(ctx, is_current ? ui_color_orange() : ui_color_muted());
+  graphics_draw_text(ctx, sequence, fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD),
+                     GRect(left, 12, 24, 20), GTextOverflowModeTrailingEllipsis,
+                     GTextAlignmentCenter, NULL);
+
+  graphics_context_set_text_color(ctx, ui_color_ink());
+  GFont name_font = fonts_get_system_font(is_current ? FONT_KEY_GOTHIC_18_BOLD : FONT_KEY_GOTHIC_18);
+  bool rtl = ui_text_is_rtl(stop->name);
+  graphics_draw_text(ctx, stop->name, name_font,
+                     GRect(left + 29, 8, right - left - 36, 28),
+                     GTextOverflowModeTrailingEllipsis,
+                     rtl ? GTextAlignmentRight : GTextAlignmentLeft, NULL);
+}
+
 static void draw_arrival_row(BusPebbILUiState *ui, GContext *ctx, const Layer *cell_layer, uint16_t row, ArrivalRow *arrival) {
   GRect bounds = layer_get_bounds(cell_layer);
   bool highlighted = menu_cell_layer_is_highlighted(cell_layer);
@@ -756,6 +791,7 @@ int16_t ui_screens_get_cell_height_callback(MenuLayer *menu_layer, MenuIndex *ce
     return layer_get_bounds(menu_layer_get_layer(menu_layer)).size.h;
   }
   if (*ui->screen == ScreenArrivals && *ui->arrival_count) return ROW_ARRIVAL_H;
+  if (*ui->screen == ScreenRouteStops) return ROW_COMPACT_H;
   if (*ui->screen == ScreenHome || *ui->screen == ScreenNearby) return ROW_HOME_H;
   (void)cell_index;
   return ROW_COMPACT_H;
@@ -784,6 +820,12 @@ void ui_screens_draw_row_callback(GContext *ctx, const Layer *cell_layer, MenuIn
       draw_text_row(ui, ctx, cell_layer, row, ui->notice[0] ? ui->notice : "No arrivals soon", "Select to refresh");
     } else {
       draw_arrival_row(ui, ctx, cell_layer, row, &ui->arrivals[row]);
+    }
+  } else if (*ui->screen == ScreenRouteStops) {
+    if (!*ui->route_stop_count) {
+      draw_text_row(ui, ctx, cell_layer, row, "Route unavailable", "Back to arrivals");
+    } else {
+      draw_route_stop_row(ui, ctx, cell_layer, row, &ui->route_stops[row]);
     }
   } else if (*ui->screen == ScreenStopCode) {
     draw_stop_code_row(ui, ctx, cell_layer, row);

@@ -1,11 +1,12 @@
 var API_BASE = 'https://open-bus-stride-api.hasadna.org.il';
 var BUS_NEARBY_API_BASE = 'https://api.busnearby.co.il/directions';
-var BUS_GOV_API_BASE = 'https://bus.gov.il';
 var CURLBUS_API_BASE = 'https://curlbus.app';
+var transitCache = require('./transit_cache');
 var DAY_MS = 24 * 60 * 60 * 1000;
 var MINUTE_MS = 60 * 1000;
 var MAX_ROWS = 24;
 var MAX_STOP_ROWS = 12;
+var MAX_ROUTE_STOP_ROWS = 64;
 var MAX_TEXT_CHARS = 64;
 var MAX_STOP_NAME_CHARS = 64;
 var STATUS_OK = 0;
@@ -69,8 +70,6 @@ var STORAGE = {
   settings: 'settings:v1',
   favoriteStops: 'favorites:stops:v1',
   favoriteLines: 'favorites:lines:v1',
-  stopIndexMeta: 'stopindex:meta:v1',
-  stopIndexChunkPrefix: 'stopindex:chunk:',
   arrivalsPrefix: 'arrivals:',
   siriStopPrefix: 'siriStop:',
   diagnostics: 'lastDiagnostics:v1',
@@ -87,8 +86,6 @@ var DEFAULT_FAVORITE_STOP = {
   lon: 34.784847
 };
 
-var DEFAULT_NEARBY_CITY = 'Tel Aviv-Yafo';
-
 var DEFAULT_SETTINGS = {
   radius_m: 400,
   refresh_sec: 30,
@@ -103,7 +100,6 @@ var DEFAULT_SETTINGS = {
   alert_only_favorite_lines: false,
   favorite_stops: [DEFAULT_FAVORITE_STOP],
   favorite_lines: [],
-  nearby_city: DEFAULT_NEARBY_CITY,
   debug: false
 };
 
@@ -261,8 +257,8 @@ function parseSettings(raw, storageAdapter) {
   settings.dark_mode = boolValue(incoming.DarkMode !== undefined ? incoming.DarkMode : settings.dark_mode, DEFAULT_SETTINGS.dark_mode);
   settings.alert_only_favorite_lines = boolValue(incoming.AlertOnlyFavoriteLines !== undefined ? incoming.AlertOnlyFavoriteLines : settings.alert_only_favorite_lines, DEFAULT_SETTINGS.alert_only_favorite_lines);
   settings.debug = boolValue(incoming.Debug !== undefined ? incoming.Debug : settings.debug, DEFAULT_SETTINGS.debug);
-  settings.nearby_city = String(incoming.NearbyCity || settings.NearbyCity || settings.nearby_city || DEFAULT_SETTINGS.nearby_city);
-  if (settings.nearby_city === 'Umm al-Fahm' || settings.nearby_city === '\u05d0\u05d5\u05dd \u05d0\u05dc \u05e4\u05d7\u05dd') settings.nearby_city = DEFAULT_NEARBY_CITY;
+  delete settings.nearby_city;
+  delete settings.NearbyCity;
 
   if (favoriteStops) settings.favorite_stops = favoriteStops;
   if (favoriteLines) settings.favorite_lines = favoriteLines;
@@ -309,12 +305,7 @@ function applyConfigValues(values, storageAdapter) {
         storage.removeItem(key);
       }
     });
-  } else if (values.ForceStopIndexRefresh === true || values.ForceStopIndexRefresh === 'true') {
-    storageKeys(storage).forEach(function(key) {
-      if (key.indexOf('stopindex:') === 0) {
-        storage.removeItem(key);
-      }
-    });
+    transitCache.clear(storage);
   }
   var parsed = {
     radius_m: values.RadiusM,
@@ -322,7 +313,6 @@ function applyConfigValues(values, storageAdapter) {
     language: values.Language,
     default_screen: values.DefaultScreen,
     max_arrivals: values.MaxArrivals,
-    nearby_city: values.NearbyCity,
     show_destination: values.ShowDestination,
     show_distance: values.ShowDistance,
     show_source_badge: values.ShowSourceBadge,
@@ -366,7 +356,7 @@ function httpJson(url, timeoutMs) {
         done = true;
         reject({ type: 'timeout', url: url });
       }, timeoutMs || 8000);
-      fetch(url).then(function(response) {
+      fetch(url, { headers: { Accept: 'application/json' } }).then(function(response) {
         if (done) return null;
         return response.text().then(function(text) {
           if (done) return;
@@ -398,6 +388,7 @@ function httpJson(url, timeoutMs) {
     }, timeoutMs || 8000);
 
     xhr.open('GET', url, true);
+    xhr.setRequestHeader('Accept', 'application/json');
     xhr.onreadystatechange = function() {
       if (xhr.readyState !== 4 || done) return;
       done = true;
@@ -463,22 +454,28 @@ function diagnosticErrorText(error) {
   return 'error';
 }
 
-function diagnosticLines(diagnostics) {
+function diagnosticLines(diagnostics, cacheStatus) {
   var diag = diagnostics || {};
   var errors = diag.errors || [];
   var lastError = errors.length ? errors[errors.length - 1] : null;
   var httpStatus = diag.httpStatus || (lastError && lastError.status) || 0;
-  return [
+  var lines = [
     'ep ' + (diag.endpoint || diag.stage || 'none'),
     'stage ' + (diag.stage || 'none') + ' http ' + (httpStatus || '-'),
     'rows ' + intValue(diag.rows, 0) + ' src ' + (diag.source || 'none') + ' age ' + intValue(diag.updatedAgoSec, 0) + 's',
     'fb ' + (diag.fallback ? 'yes' : 'no') + ' err ' + diagnosticErrorText(lastError)
   ];
+  if (cacheStatus) {
+    lines[3] = 'gtfs ' + cacheStatus.status + ' s' + cacheStatus.stopCount +
+      ' q' + cacheStatus.scheduleCount + ' r' + cacheStatus.routeCount +
+      ' ' + Math.round(cacheStatus.snapshotBytes / 1024) + 'k';
+  }
+  return lines;
 }
 
-function packDiagnostics(diagnostics, messageKeys) {
+function packDiagnostics(diagnostics, messageKeys, cacheStatus) {
   var dict = {};
-  var lines = diagnosticLines(diagnostics);
+  var lines = diagnosticLines(diagnostics, cacheStatus);
   dict[messageKeys.ReqType] = 6;
   dict[messageKeys.Status] = STATUS_OK;
   if (messageKeys.DebugLine0 !== undefined) dict[messageKeys.DebugLine0] = watchText(lines[0], 'stage none', MAX_TEXT_CHARS, false);
@@ -678,6 +675,13 @@ function normalizeArrivalRow(row, now, settings, forcedSource) {
   var scheduledTime = parseTime(scheduledValue, now);
   var delayMin = scheduledTime ? Math.round((arrivalTime.getTime() - scheduledTime.getTime()) / MINUTE_MS) : 0;
   var operator = String(firstValue(row, ['operator', 'agency_name', 'gtfs_agency.name', 'gtfs_route__agency_name']) || '');
+  var routeRef = intValue(firstValue(row, [
+    'route_ref',
+    'line_id',
+    'route_id',
+    'gtfs_route__line_ref',
+    'siri_ride__line_ref'
+  ]), 0);
   var flags = 0;
   if (isFavoriteLine(line, operator, settings)) flags |= 1;
   if (delayMin > 2) flags |= 2;
@@ -692,6 +696,7 @@ function normalizeArrivalRow(row, now, settings, forcedSource) {
     scheduledTimeIso: scheduledTime ? scheduledTime.toISOString() : '',
     delayMin: delayMin,
     operator: operator,
+    routeRef: routeRef,
     source: source,
     freshnessSec: freshnessSec,
     vehicleAtStop: vehicleAtStop,
@@ -731,33 +736,6 @@ function normalizeScheduledRows(rows, stop, now, settings) {
   return dedupeAndSortArrivals(normalized, settings || DEFAULT_SETTINGS);
 }
 
-function normalizeBusGovRows(rows, stop, now, settings) {
-  var baseTime = now || new Date();
-  var mapped = [];
-  asRows(rows).forEach(function(row) {
-    if (row.ResponseSuccesed === false) return;
-    var line = row.Shilut || row.LineNumber || row.NAME || row.ID;
-    var destination = row.DestinationQuarterName || row.DestinationName || row.DestinationEngName || row.Description || '';
-    var minutesList = Array.isArray(row.MinutesToArrivalList) ? row.MinutesToArrivalList : [row.MinutesToArrival];
-    minutesList.forEach(function(value) {
-      var minutes = intValue(value, -1);
-      if (minutes < 0) return;
-      var arrivalTime = addMinutes(baseTime, minutes);
-      mapped.push({
-        line: line,
-        destination: destination,
-        operator: row.CompanyEnglishName || row.CompanyName || row.CompanyHebrewName || '',
-        _buspebble_arrival_time: arrivalTime.toISOString(),
-        recorded_at_time: baseTime.toISOString(),
-        vehicle_at_stop: minutes === 0
-      });
-    });
-  });
-  return dedupeAndSortArrivals(mapped.map(function(row) {
-    return normalizeArrivalRow(row, baseTime, settings || DEFAULT_SETTINGS, 'live');
-  }).filter(Boolean), settings || DEFAULT_SETTINGS);
-}
-
 function curlbusDestination(visit) {
   return firstValue(visit, [
     'static_info.route.destination.name.EN',
@@ -793,6 +771,7 @@ function normalizeCurlbusRows(payload, stop, now, settings) {
         'static_info.route.agency.name.HE',
         'operator_name'
       ]) || '',
+      route_ref: visit.line_id || visit.route_id || 0,
       _buspebble_arrival_time: visit.eta,
       recorded_at_time: visit.timestamp || payload.timestamp || baseTime.toISOString(),
       vehicle_at_stop: visit.status === 'at_stop'
@@ -803,11 +782,21 @@ function normalizeCurlbusRows(payload, stop, now, settings) {
   }).filter(Boolean), settings || DEFAULT_SETTINGS);
 }
 
-function getStopByCode(code) {
+function fetchStopByCode(code) {
   return apiGet('/gtfs_stops/list', { code: code, limit: 1, order_by: 'id desc' }, 3500).then(function(payload) {
     var row = asRows(payload)[0];
     if (!row) throw { type: 'not_found', stage: 'gtfs_stop', code: code };
     return normalizeStop(row);
+  });
+}
+
+function getStopByCode(code, storageAdapter) {
+  var storage = getStorage(storageAdapter);
+  var cachedStop = transitCache.findStop(storage, code);
+  if (cachedStop) return Promise.resolve(normalizeStop(cachedStop));
+  return fetchStopByCode(code).then(function(stop) {
+    transitCache.rememberVisitedStop(storage, stop);
+    return stop;
   });
 }
 
@@ -862,7 +851,7 @@ function getRecentSiriRideStops(siriStopId, now, settings) {
   }, 4500);
 }
 
-function getScheduledFallback(stop, now, settings) {
+function fetchScheduledWindow(stop, now, settings) {
   function rideStopParams(from, to) {
     var params = {
       arrival_time_from: from,
@@ -890,6 +879,63 @@ function getScheduledFallback(stop, now, settings) {
   });
 }
 
+function getScheduledFallback(stop, now, settings, storageAdapter) {
+  var storage = getStorage(storageAdapter);
+  var cachedRows = transitCache.getSchedule(storage, stop.code);
+  if (cachedRows.length) return Promise.resolve(cachedRows);
+  return fetchScheduledWindow(stop, now, settings).then(function(rows) {
+    transitCache.putSchedule(storage, stop.code, rows);
+    return rows;
+  });
+}
+
+function localDayStart(date) {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate(), 0, 0, 0, 0);
+}
+
+function shiftRowsToLocalDate(rows, targetDate) {
+  return asRows(rows).map(function(row) {
+    var shiftedRow = {};
+    Object.keys(row).forEach(function(key) { shiftedRow[key] = row[key]; });
+    var arrival = parseTime(row.arrival_time || row.gtfs_ride_stop__arrival_time, targetDate);
+    if (!arrival) return shiftedRow;
+    var shifted = new Date(Date.UTC(
+      targetDate.getFullYear(),
+      targetDate.getMonth(),
+      targetDate.getDate(),
+      arrival.getUTCHours(),
+      arrival.getUTCMinutes(),
+      arrival.getUTCSeconds()
+    ));
+    shiftedRow._buspebble_arrival_time = shifted.toISOString();
+    shiftedRow._buspebble_scheduled_time = shifted.toISOString();
+    return shiftedRow;
+  });
+}
+
+function fetchScheduledDay(stop, refreshTime) {
+  var targetDay = localDayStart(new Date(refreshTime || Date.now()));
+  var daysAgo = 0;
+  function tryServiceDay() {
+    var serviceDay = addMinutes(targetDay, -daysAgo * 24 * 60);
+    return apiGet('/gtfs_ride_stops/list', {
+      gtfs_stop__code: stop.code,
+      arrival_time_from: isoWithOffset(serviceDay),
+      arrival_time_to: isoWithOffset(addMinutes(serviceDay, 24 * 60)),
+      limit: 1000,
+      order_by: 'arrival_time asc'
+    }, 10000).then(function(payload) {
+      var rows = asRows(payload);
+      if (rows.length || daysAgo >= 7) {
+        return daysAgo ? shiftRowsToLocalDate(rows, targetDay) : rows;
+      }
+      daysAgo += 1;
+      return tryServiceDay();
+    });
+  }
+  return tryServiceDay();
+}
+
 function getSparseStopArrivalsFallback(stop, settings) {
   var params = {
     limit: maxArrivalRows(settings || DEFAULT_SETTINGS),
@@ -900,19 +946,116 @@ function getSparseStopArrivalsFallback(stop, settings) {
   return apiGet('/stop_arrivals/list', params, 6000);
 }
 
-function getBusGovLiveArrivals(stopCode, settings) {
-  var language = settings && settings.language === 'he' ? 'he' : 'en';
-  return apiGetUrl(BUS_GOV_API_BASE, '/WebApi/api/passengerinfo/GetRealtimeBusLineListByBustop/' + encodeURIComponent(String(stopCode)) + '/' + language + '/false', {}, 4500);
+function getCurlbusLiveArrivals(stopCode) {
+  return apiGetUrl(CURLBUS_API_BASE, '/' + encodeURIComponent(String(stopCode)), {}, 1500);
 }
 
-function getCurlbusLiveArrivals(stopCode) {
-  return apiGetUrl(CURLBUS_API_BASE, '/' + encodeURIComponent(String(stopCode)), { format: 'json' }, 1500);
+function routeResultFromPayload(payload, candidate) {
+  var rows = asRows(payload).slice().sort(function(a, b) {
+    return intValue(a.stop_sequence, 0) - intValue(b.stop_sequence, 0);
+  });
+  var stops = rows.map(function(row) {
+    return {
+      code: intValue(row.gtfs_stop__code || row.stop_code, 0),
+      name: String(row.gtfs_stop__name || row.stop_name || row.gtfs_stop__code || 'Stop'),
+      city: String(row.gtfs_stop__city || row.city || '')
+    };
+  });
+  var currentIndex = -1;
+  stops.some(function(stop, index) {
+    if (stop.code !== candidate.stopCode) return false;
+    currentIndex = index;
+    return true;
+  });
+  if (!stops.length || currentIndex < 0) {
+    throw { type: 'not_found', stage: 'route_stops', routeRef: candidate.routeRef };
+  }
+  return {
+    routeRef: candidate.routeRef,
+    line: candidate.line,
+    stops: stops,
+    currentIndex: currentIndex
+  };
+}
+
+function fetchRoutePattern(candidate, now) {
+  candidate = candidate || {};
+  var routeRef = intValue(candidate.routeRef, 0);
+  var stopCode = intValue(candidate.stopCode, 0);
+  var line = String(candidate.line || '').replace(/^\s+|\s+$/g, '');
+  var rideId = intValue(candidate.rideId, 0);
+  var baseTime = now || new Date();
+  if ((!routeRef && !line) || !stopCode) {
+    return Promise.reject({ type: 'invalid_route', routeRef: routeRef, stopCode: stopCode });
+  }
+
+  function fetchRide(knownRideId) {
+    return apiGet('/gtfs_ride_stops/list', {
+      gtfs_ride_ids: knownRideId,
+      limit: 200,
+      order_by: 'stop_sequence asc'
+    }, 6000).then(function(payload) {
+      return routeResultFromPayload(payload, { routeRef: routeRef, line: line, stopCode: stopCode });
+    });
+  }
+  if (rideId) return fetchRide(rideId);
+
+  function candidateParamsFor(windowTime, useLine) {
+    var params = {
+      gtfs_stop__code: stopCode,
+      arrival_time_from: isoWithOffset(addMinutes(windowTime, -30)),
+      arrival_time_to: isoWithOffset(addMinutes(windowTime, 180)),
+      limit: 32,
+      order_by: 'arrival_time asc'
+    };
+    if (useLine || !routeRef) params.gtfs_route__route_short_name = line;
+    else params.gtfs_route__line_refs = routeRef;
+    return params;
+  }
+
+  var daysAgo = 0;
+  function findCandidate() {
+    var windowTime = addMinutes(baseTime, -daysAgo * 24 * 60);
+    return apiGet('/gtfs_ride_stops/list', candidateParamsFor(windowTime, false), 5000).then(function(payload) {
+      var rows = asRows(payload);
+      if (rows.length || !routeRef || !line) return rows;
+      return apiGet('/gtfs_ride_stops/list', candidateParamsFor(windowTime, true), 5000).then(asRows);
+    }).then(function(rows) {
+      if (rows.length || daysAgo >= 7) return rows;
+      daysAgo += 1;
+      return findCandidate();
+    });
+  }
+
+  return findCandidate().then(function(rows) {
+    var found = rows[0];
+    rideId = found && intValue(found.gtfs_ride_id, 0);
+    routeRef = found ? intValue(found.gtfs_route__line_ref, routeRef) : routeRef;
+    if (!rideId) throw { type: 'not_found', stage: 'route_ride', routeRef: routeRef, line: line };
+    return fetchRide(rideId);
+  });
+}
+
+function getRouteStops(routeRef, stopCode, now, line, storageAdapter) {
+  var storage = getStorage(storageAdapter);
+  var candidate = {
+    routeRef: intValue(routeRef, 0),
+    stopCode: intValue(stopCode, 0),
+    line: String(line || '').replace(/^\s+|\s+$/g, '')
+  };
+  var cachedRoute = transitCache.getRoute(storage, candidate.routeRef, candidate.stopCode, candidate.line);
+  if (cachedRoute) return Promise.resolve(cachedRoute);
+  return fetchRoutePattern(candidate, now).then(function(result) {
+    transitCache.putRoute(storage, result);
+    return result;
+  });
 }
 
 function getArrivalsForStop(storageAdapter, stop, settings) {
   var storage = getStorage(storageAdapter);
   var now = new Date();
   var normalizedStop = normalizeStop(stop);
+  transitCache.rememberVisitedStop(storage, normalizedStop);
   var diagnostics = { stage: 'start', source: null, errors: [], rows: 0, fallback: false };
   var cacheKey = STORAGE.arrivalsPrefix + normalizedStop.code + ':v1';
 
@@ -960,27 +1103,22 @@ function getArrivalsForStop(storageAdapter, stop, settings) {
       throw { type: 'empty', stage: 'curlbus_live' };
     }).catch(function(curlbusError) {
       diagnostics.errors.push(curlbusError);
-      diagnostics.stage = 'bus_gov_live';
-      diagnostics.endpoint = 'bus_gov_live';
-      return getBusGovLiveArrivals(normalizedStop.code, settings);
-    }).then(function(payload) {
-      if (payload && payload.meta && payload.rows) return payload;
-      var liveArrivals = normalizeBusGovRows(payload, normalizedStop, now, settings);
-      if (liveArrivals.length) {
-        return finish(liveArrivals, 'live', liveArrivals[0].freshnessSec || 0);
+      var scheduledRows = transitCache.getSchedule(storage, normalizedStop.code);
+      var scheduledArrivals = normalizeScheduledRows(scheduledRows, normalizedStop, now, settings);
+      if (scheduledArrivals.length) {
+        diagnostics.stage = 'phone_gtfs_cache';
+        diagnostics.endpoint = 'local';
+        diagnostics.fallback = true;
+        return finish(scheduledArrivals, 'scheduled', 0);
       }
-      diagnostics.errors.push({ type: 'empty', stage: 'bus_gov_live' });
-      throw { type: 'empty', stage: 'bus_gov_live' };
-    }).catch(function(busGovError) {
-      diagnostics.errors.push(busGovError);
-      if (shouldBackoffProviderError(busGovError)) {
+      if (shouldBackoffProviderError(curlbusError)) {
         noteRateLimit(storage);
         diagnostics.fallback = true;
-        return cacheFallback(statusForProviderError(busGovError));
+        return cacheFallback(statusForProviderError(curlbusError));
       }
       diagnostics.stage = 'siri_stop';
       diagnostics.endpoint = 'siri_ride_stops';
-      return Promise.resolve(normalizedStop.gtfsId ? normalizedStop : getStopByCode(normalizedStop.code).catch(function(stopError) {
+      return Promise.resolve(normalizedStop.gtfsId ? normalizedStop : getStopByCode(normalizedStop.code, storage).catch(function(stopError) {
         diagnostics.errors.push(stopError);
         return normalizedStop;
       })).then(function(resolvedStop) {
@@ -1007,7 +1145,7 @@ function getArrivalsForStop(storageAdapter, stop, settings) {
     diagnostics.stage = 'scheduled_fallback';
     diagnostics.endpoint = 'gtfs_ride_stops';
     diagnostics.fallback = true;
-    return getScheduledFallback(normalizedStop, now, settings).then(function(payload) {
+    return getScheduledFallback(normalizedStop, now, settings, storage).then(function(payload) {
       var arrivals = normalizeScheduledRows(payload, normalizedStop, now, settings);
       if (arrivals.length) return finish(arrivals, 'scheduled', 0);
       diagnostics.errors.push({ type: 'empty', stage: 'scheduled_fallback' });
@@ -1067,6 +1205,31 @@ function packArrivalRows(rows, meta, messageKeys, settings) {
     dict[messageKeys.Minutes0 + i] = intValue(row.minutes, 0);
     dict[messageKeys.DelayMin0 + i] = intValue(row.delayMin, 0);
     dict[messageKeys.Flags0 + i] = flags;
+    if (messageKeys.ArrivalRoute0 !== undefined) {
+      dict[messageKeys.ArrivalRoute0 + i] = intValue(row.routeRef, 0);
+    }
+  });
+  return dict;
+}
+
+function packRouteStops(result, messageKeys) {
+  var dict = {};
+  var stops = result && result.stops ? result.stops : [];
+  var currentIndex = intValue(result && result.currentIndex, 0);
+  var start = currentIndex >= MAX_ROUTE_STOP_ROWS ? currentIndex - Math.floor(MAX_ROUTE_STOP_ROWS / 2) : 0;
+  if (start + MAX_ROUTE_STOP_ROWS > stops.length) start = Math.max(0, stops.length - MAX_ROUTE_STOP_ROWS);
+  var visibleStops = stops.slice(start, start + MAX_ROUTE_STOP_ROWS);
+
+  dict[messageKeys.ReqType] = 7;
+  dict[messageKeys.Status] = STATUS_OK;
+  dict[messageKeys.RouteRef] = intValue(result && result.routeRef, 0);
+  dict[messageKeys.RouteCurrentIndex] = Math.max(0, currentIndex - start);
+  dict[messageKeys.RouteStopCount] = visibleStops.length;
+  visibleStops.forEach(function(stop, index) {
+    dict[messageKeys.RouteStopName0 + index] = watchText(stop.name, 'Stop ' + stop.code, 20, true);
+    if (messageKeys.RouteStopCode0 !== undefined) {
+      dict[messageKeys.RouteStopCode0 + index] = intValue(stop.code, 0);
+    }
   });
   return dict;
 }
@@ -1105,68 +1268,44 @@ function packError(status, reqType, messageKeys) {
   return dict;
 }
 
-function boundingBox(lat, lon, radiusM) {
-  var latDelta = radiusM / 111320;
-  var lonDelta = radiusM / (111320 * Math.cos(lat * Math.PI / 180));
+var dailyTransitRefreshPromise = null;
+
+function refreshDailyTransitCache(storageAdapter, settings, now) {
+  var storage = getStorage(storageAdapter);
+  if (dailyTransitRefreshPromise) return dailyTransitRefreshPromise;
+  dailyTransitRefreshPromise = transitCache.refreshDaily(storage, settings, {
+    loadSchedule: function(stop, refreshTime) {
+      return fetchScheduledDay(normalizeStop(stop), refreshTime);
+    },
+    loadRoute: function(candidate, refreshTime) {
+      return fetchRoutePattern(candidate, new Date(refreshTime));
+    }
+  }, now).then(function(snapshot) {
+    dailyTransitRefreshPromise = null;
+    return snapshot;
+  }, function(error) {
+    dailyTransitRefreshPromise = null;
+    throw error;
+  });
+  return dailyTransitRefreshPromise;
+}
+
+function getTransitCacheStatus(storageAdapter) {
+  var snapshot = transitCache.readSnapshot(getStorage(storageAdapter));
   return {
-    minLat: lat - latDelta,
-    maxLat: lat + latDelta,
-    minLon: lon - lonDelta,
-    maxLon: lon + lonDelta
+    status: snapshot.status,
+    savedAt: snapshot.savedAt,
+    expiresAt: snapshot.expiresAt,
+    stationCount: snapshot.stations.length,
+    stopCount: snapshot.stations.length,
+    scheduleCount: Object.keys(snapshot.schedules).length,
+    routeCount: Object.keys(snapshot.routes).length,
+    snapshotBytes: JSON.stringify(snapshot).length
   };
 }
 
-function distanceMeters(lat1, lon1, lat2, lon2) {
-  var R = 6371000;
-  var toRad = function(x) { return x * Math.PI / 180; };
-  var dLat = toRad(lat2 - lat1);
-  var dLon = toRad(lon2 - lon1);
-  var a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
-    Math.sin(dLon / 2) * Math.sin(dLon / 2);
-  return 2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-}
-
-function nearbyStops(stopIndex, lat, lon, radiusM) {
-  var box = boundingBox(lat, lon, radiusM);
-  return (stopIndex || []).map(normalizeStop).filter(function(stop) {
-    return stop.lat && stop.lon &&
-      stop.lat >= box.minLat && stop.lat <= box.maxLat &&
-      stop.lon >= box.minLon && stop.lon <= box.maxLon;
-  }).map(function(stop) {
-    stop.distanceM = Math.round(distanceMeters(lat, lon, stop.lat, stop.lon));
-    return stop;
-  }).filter(function(stop) {
-    return stop.distanceM <= radiusM;
-  }).sort(function(a, b) {
-    return a.distanceM - b.distanceM;
-  }).filter(function(stop, index, arr) {
-    return index === arr.findIndex(function(other) { return other.code === stop.code; });
-  }).slice(0, MAX_STOP_ROWS);
-}
-
-function fetchStopIndexByCity(storageAdapter, city) {
-  var storage = getStorage(storageAdapter);
-  var key = STORAGE.stopIndexChunkPrefix + city + ':v1';
-  return cached(storage, key, 7 * DAY_MS, function() {
-    return apiGet('/gtfs_stops/list', {
-      city: city,
-      limit: 1000,
-      order_by: 'code asc'
-    }, 8000).then(function(payload) {
-      var stops = asRows(payload).map(normalizeStop).filter(function(stop) {
-        return stop.code && stop.lat && stop.lon;
-      });
-      storage.setItem(STORAGE.stopIndexMeta, JSON.stringify({
-        city: city,
-        source: 'openbus_gtfs_stops',
-        count: stops.length,
-        savedAt: Date.now(),
-        expiresAt: Date.now() + 7 * DAY_MS
-      }));
-      return stops;
-    });
-  });
+function invalidateTransitCache(storageAdapter) {
+  return transitCache.invalidate(getStorage(storageAdapter));
 }
 
 function normalizeBusNearbyStop(stop) {
@@ -1193,6 +1332,48 @@ function fetchBusNearbyStops(lat, lon, radiusM, settings) {
       return stop.code && stop.lat && stop.lon;
     }).slice(0, MAX_STOP_ROWS);
   });
+}
+
+function warmNearbyTransitCache(storageAdapter, stops, settings, now) {
+  var storage = getStorage(storageAdapter);
+  var refreshTime = now instanceof Date ? now.getTime() : Number(now || Date.now());
+  var nearbyStations = uniqueStops((stops || []).map(normalizeStop)).slice(0, MAX_STOP_ROWS);
+  var routeCandidates = [];
+  var stationIndex = 0;
+  transitCache.rememberStations(storage, nearbyStations);
+
+  function loadNextSchedule() {
+    if (stationIndex >= nearbyStations.length) return loadRoutes();
+    var station = nearbyStations[stationIndex++];
+    return fetchScheduledDay(station, refreshTime).then(function(rows) {
+      transitCache.putSchedule(storage, station.code, rows, refreshTime);
+      (rows || []).forEach(function(row) {
+        var candidate = transitCache.routeCandidate(row, station.code);
+        if (candidate) routeCandidates.push(candidate);
+      });
+      return loadNextSchedule();
+    }, function() {
+      return loadNextSchedule();
+    });
+  }
+
+  function loadRoutes() {
+    routeCandidates = transitCache.uniqueRouteCandidates(routeCandidates, 32);
+    var routeIndex = 0;
+    function loadNextRoute() {
+      if (routeIndex >= routeCandidates.length) return getTransitCacheStatus(storage);
+      var candidate = routeCandidates[routeIndex++];
+      return fetchRoutePattern(candidate, new Date(refreshTime)).then(function(route) {
+        transitCache.putRoute(storage, route, refreshTime);
+        return loadNextRoute();
+      }, function() {
+        return loadNextRoute();
+      });
+    }
+    return loadNextRoute();
+  }
+
+  return loadNextSchedule();
 }
 
 function addFavoriteStop(storageAdapter, stop) {
@@ -1248,21 +1429,24 @@ module.exports = {
   applyConfigValues: applyConfigValues,
   normalizeConfigValues: normalizeConfigValues,
   normalizeSiriRows: normalizeSiriRows,
-  normalizeBusGovRows: normalizeBusGovRows,
   normalizeCurlbusRows: normalizeCurlbusRows,
   normalizeScheduledRows: normalizeScheduledRows,
   operatorColorIndex: operatorColorIndex,
   packArrivalRows: packArrivalRows,
+  packRouteStops: packRouteStops,
   packStops: packStops,
   packDiagnostics: packDiagnostics,
   packError: packError,
   loadDiagnostics: loadDiagnostics,
   shouldBackoffProviderError: shouldBackoffProviderError,
-  nearbyStops: nearbyStops,
-  fetchStopIndexByCity: fetchStopIndexByCity,
   fetchBusNearbyStops: fetchBusNearbyStops,
+  warmNearbyTransitCache: warmNearbyTransitCache,
   normalizeBusNearbyStop: normalizeBusNearbyStop,
   getArrivalsForStop: getArrivalsForStop,
+  getRouteStops: getRouteStops,
+  refreshDailyTransitCache: refreshDailyTransitCache,
+  getTransitCacheStatus: getTransitCacheStatus,
+  invalidateTransitCache: invalidateTransitCache,
   addFavoriteStop: addFavoriteStop,
   removeFavoriteStop: removeFavoriteStop,
   toggleFavoriteLine: toggleFavoriteLine,

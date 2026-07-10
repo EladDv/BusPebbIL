@@ -2,6 +2,8 @@ const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
 const core = require('../src/pkjs/buspebble_core');
+const transitCache = require('../src/pkjs/transit_cache');
+const clayConfig = require('../src/pkjs/config');
 
 const keys = {
   ReqType: 0,
@@ -33,7 +35,13 @@ const keys = {
   DebugLine0: 174,
   DebugLine1: 175,
   DebugLine2: 176,
-  DebugLine3: 177
+  DebugLine3: 177,
+  ArrivalRoute0: 178,
+  RouteRef: 202,
+  RouteCurrentIndex: 203,
+  RouteStopName0: 204,
+  RouteStopCount: 268,
+  RouteStopCode0: 269
 };
 
 function fixture(name) {
@@ -85,50 +93,20 @@ function testNormalizeScheduledRows() {
   assert.strictEqual(arrivals[0].source, 'scheduled');
 }
 
-function testNormalizeBusGovRows() {
-  const now = new Date('2026-06-28T12:00:00+03:00');
-  const arrivals = core.normalizeBusGovRows([
-    {
-      Shilut: '83',
-      DestinationQuarterName: 'Tel Aviv-Yafo Arlozorov Terminal',
-      CompanyName: 'Superbus',
-      MinutesToArrival: 1,
-      MinutesToArrivalList: [1, 3]
-    },
-    {
-      Shilut: '347',
-      DestinationQuarterName: 'Raanana Industrial Zone',
-      CompanyName: 'Metropoline',
-      MinutesToArrival: 2
-    }
-  ], { code: 20004 }, now, { max_arrivals: 6, favorite_lines: [{ line: '83' }] });
-  assert.strictEqual(arrivals.length, 3);
-  assert.strictEqual(arrivals[0].line, '83');
-  assert.strictEqual(arrivals[0].minutes, 1);
-  assert.strictEqual(arrivals[0].source, 'live');
-  assert.strictEqual(arrivals[0].freshnessSec, 0);
-  assert.strictEqual(arrivals[0].flags & 1, 1);
-  assert.strictEqual(arrivals[1].line, '83');
-  assert.strictEqual(arrivals[1].minutes, 3);
-  assert.strictEqual(arrivals[2].line, '347');
-}
-
 function testFavoriteLineOperatorMatching() {
   const now = new Date('2026-06-28T12:00:00+03:00');
-  const arrivals = core.normalizeBusGovRows([
+  const arrivals = core.normalizeCurlbusRows({ visits: [
     {
-      Shilut: '480',
-      DestinationQuarterName: 'Jerusalem',
-      CompanyName: 'Egged',
-      MinutesToArrival: 4
+      line_name: '480',
+      eta: new Date(now.getTime() + 4 * 60 * 1000).toISOString(),
+      static_info: { route: { agency: { name: { EN: 'Egged' } }, destination: { name: { EN: 'Jerusalem' } } } }
     },
     {
-      Shilut: '480',
-      DestinationQuarterName: 'Jerusalem',
-      CompanyName: 'Other Operator',
-      MinutesToArrival: 2
+      line_name: '480',
+      eta: new Date(now.getTime() + 2 * 60 * 1000).toISOString(),
+      static_info: { route: { agency: { name: { EN: 'Other Operator' } }, destination: { name: { EN: 'Jerusalem' } } } }
     }
-  ], { code: 20004 }, now, {
+  ] }, { code: 20004 }, now, {
     max_arrivals: 6,
     favorite_lines: [{ line: '480', operator: 'Egged' }]
   });
@@ -137,39 +115,6 @@ function testFavoriteLineOperatorMatching() {
   assert.strictEqual(arrivals[0].flags & 1, 1);
   assert.strictEqual(arrivals[1].operator, 'Other Operator');
   assert.strictEqual(arrivals[1].flags & 1, 0);
-}
-
-function testBusGovLiveFixture() {
-  const now = new Date('2026-06-28T12:00:00+03:00');
-  const arrivals = core.normalizeBusGovRows(
-    fixture('bus_gov_live_sample.json'),
-    { code: 20004 },
-    now,
-    { max_arrivals: 6, favorite_lines: [] }
-  );
-  assert.strictEqual(arrivals.length, 3);
-  assert.strictEqual(arrivals[0].line, '501');
-  assert.strictEqual(arrivals[0].minutes, 1);
-  assert.strictEqual(arrivals[0].source, 'live');
-  assert.strictEqual(arrivals[1].line, '271');
-  assert.strictEqual(arrivals[1].destination, 'Tel Aviv-Yafo University');
-
-  [
-    ['bus_gov_live_stop_22947.json', 22947, '89'],
-    ['bus_gov_live_stop_25702.json', 25702, '276'],
-    ['bus_gov_live_stop_40679.json', 40679, '3']
-  ].forEach(([name, code, firstLine]) => {
-    const sample = core.normalizeBusGovRows(
-      fixture(name),
-      { code },
-      now,
-      { max_arrivals: 6, favorite_lines: [] }
-    );
-    assert(sample.length > 0);
-    assert(sample.length <= 6);
-    assert.strictEqual(sample[0].line, firstLine);
-    assert.strictEqual(sample[0].source, 'live');
-  });
 }
 
 function testCurlbusLiveFixture() {
@@ -185,24 +130,13 @@ function testCurlbusLiveFixture() {
   assert.strictEqual(arrivals[0].minutes, 1);
   assert.strictEqual(arrivals[0].source, 'live');
   assert.strictEqual(arrivals[0].destination, 'Ra\'anana Terminal/HaPnina');
+  assert.strictEqual(arrivals[0].routeRef, 7700);
   assert.strictEqual(arrivals[1].line, '501');
-}
-
-function testNearbyStops() {
-  const stops = [
-    { code: 1, name: 'Near', lat: 32.0801, lon: 34.7701 },
-    { code: 2, name: 'Far', lat: 32.1, lon: 34.8 },
-    { code: 1, name: 'Duplicate', lat: 32.0801, lon: 34.7701 }
-  ];
-  const nearby = core.nearbyStops(stops, 32.08, 34.77, 400);
-  assert.strictEqual(nearby.length, 1);
-  assert.strictEqual(nearby[0].code, 1);
-  assert(nearby[0].distanceM < 50);
 }
 
 function testPackArrivalRows() {
   const rows = [
-    { line: '123456789', destination: 'A very long destination name', minutes: 3, delayMin: 1, flags: 1 }
+    { line: '123456789', destination: 'A very long destination name', minutes: 3, delayMin: 1, flags: 1, routeRef: 7700 }
   ];
   const dict = core.packArrivalRows(rows, { source: 'siri', updatedAgoSec: 42 }, keys, { max_arrivals: 6 });
   assert.strictEqual(dict[keys.ReqType], 1);
@@ -211,6 +145,7 @@ function testPackArrivalRows() {
   assert.strictEqual(dict[keys.Line0], '123456789');
   assert.strictEqual(dict[keys.Dest0], 'A very long destination name');
   assert.strictEqual(dict[keys.Minutes0], 3);
+  assert.strictEqual(dict[keys.ArrivalRoute0], 7700);
   assert.strictEqual(dict[keys.Line0 + 1], undefined);
 
   const manyRows = Array.from({ length: 30 }, (_, i) => ({
@@ -262,6 +197,67 @@ function testPackArrivalRows() {
   assert.strictEqual(onlyFavoriteAlertsDict[keys.Flags0 + 1] & 8, 8);
 }
 
+async function testGetAndPackRouteStops() {
+  const originalFetch = global.fetch;
+  const seenUrls = [];
+
+  global.fetch = function(url) {
+    const textUrl = String(url);
+    seenUrls.push(textUrl);
+    if (textUrl.indexOf('gtfs_route__line_refs=9999') !== -1) {
+      return Promise.resolve({
+        status: 200,
+        text: () => Promise.resolve('[]')
+      });
+    }
+    if (textUrl.indexOf('gtfs_stop__code=20004') !== -1) {
+      return Promise.resolve({
+        status: 200,
+        text: () => Promise.resolve(JSON.stringify([{
+          gtfs_ride_id: 150103157,
+          gtfs_route__line_ref: 7700,
+          gtfs_stop__code: 20004
+        }]))
+      });
+    }
+    if (textUrl.indexOf('gtfs_ride_ids=150103157') !== -1) {
+      return Promise.resolve({
+        status: 200,
+        text: () => Promise.resolve(JSON.stringify([
+          { stop_sequence: 1, gtfs_stop__code: 21256, gtfs_stop__name: 'Central Station' },
+          { stop_sequence: 2, gtfs_stop__code: 20004, gtfs_stop__name: 'HaMasger/Yad Harutsim' },
+          { stop_sequence: 3, gtfs_stop__code: 23017, gtfs_stop__name: 'HaMasger/Israel Tal' }
+        ]))
+      });
+    }
+    return Promise.reject(new Error('Unexpected fetch ' + textUrl));
+  };
+
+  try {
+    const result = await core.getRouteStops(9999, 20004, new Date('2026-07-10T08:30:00+03:00'), '47');
+    assert.strictEqual(result.routeRef, 7700);
+    assert.strictEqual(result.currentIndex, 1);
+    assert.strictEqual(result.stops.length, 3);
+    assert.strictEqual(result.stops[1].name, 'HaMasger/Yad Harutsim');
+    assert(seenUrls[0].indexOf('gtfs_route__line_refs=9999') !== -1);
+    assert(seenUrls[1].indexOf('gtfs_route__route_short_name=47') !== -1);
+    assert(seenUrls[2].indexOf('order_by=stop_sequence%20asc') !== -1);
+
+    const packed = core.packRouteStops(result, keys);
+    assert.strictEqual(packed[keys.ReqType], 7);
+    assert.strictEqual(packed[keys.Status], 0);
+    assert.strictEqual(packed[keys.RouteRef], 7700);
+    assert.strictEqual(packed[keys.RouteCurrentIndex], 1);
+    assert.strictEqual(packed[keys.RouteStopCount], 3);
+    assert.strictEqual(packed[keys.RouteStopName0], 'Central Station');
+    assert.strictEqual(packed[keys.RouteStopName0 + 1], 'HaMasger/Yad Haru...');
+    assert.strictEqual(packed[keys.RouteStopCode0], 21256);
+    assert.strictEqual(packed[keys.RouteStopCode0 + 1], 20004);
+  } finally {
+    global.fetch = originalFetch;
+  }
+}
+
 function testOperatorColorPacking() {
   assert.strictEqual(core.operatorColorIndex('Egged'), 1);
   assert.strictEqual(core.operatorColorIndex('Dan'), 2);
@@ -290,9 +286,9 @@ function testParseSettingsRecoversFromCorruptJson() {
   assert.deepStrictEqual(settings.favorite_lines.map((line) => line.line), ['5', '480']);
 }
 
-function testDefaultSettingsUseTelAvivStop() {
+function testDefaultSettingsDoNotUseCityIndex() {
   const settings = core.parseSettings(null, core.memoryStorage());
-  assert.strictEqual(settings.nearby_city, 'Tel Aviv-Yafo');
+  assert.strictEqual(settings.nearby_city, undefined);
   assert.strictEqual(settings.favorite_stops[0].code, 20004);
   assert.strictEqual(settings.favorite_stops[0].city, 'Tel Aviv-Yafo');
   assert.strictEqual(settings.favorite_stops[0].name, 'HaMasger/Yad Harutsim');
@@ -346,15 +342,10 @@ function testFavoriteLinesJsonPreservesOperator() {
   assert.deepStrictEqual(core.parseSettings(null, storage).favorite_lines, settings.favorite_lines);
 }
 
-function testForceStopIndexRefreshOnlyClearsStopIndex() {
-  const storage = core.memoryStorage();
-  storage.setItem(core.STORAGE.stopIndexChunkPrefix + 'tel-aviv:v1', 'cached');
-  storage.setItem(core.STORAGE.stopIndexMeta, 'meta');
-  storage.setItem(core.STORAGE.arrivalsPrefix + '20004:v1', 'arrivals');
-  core.applyConfigValues({ ForceStopIndexRefresh: true }, storage);
-  assert.strictEqual(storage.getItem(core.STORAGE.stopIndexChunkPrefix + 'tel-aviv:v1'), null);
-  assert.strictEqual(storage.getItem(core.STORAGE.stopIndexMeta), null);
-  assert.strictEqual(storage.getItem(core.STORAGE.arrivalsPrefix + '20004:v1'), 'arrivals');
+function testConfigDoesNotExposeCityCaching() {
+  const serialized = JSON.stringify(clayConfig);
+  assert.strictEqual(serialized.indexOf('NearbyCity'), -1);
+  assert.strictEqual(serialized.indexOf('ForceStopIndexRefresh'), -1);
 }
 
 function testToggleFavoriteLinePersistsAndRemoves() {
@@ -465,13 +456,13 @@ function testPackDiagnostics() {
     updatedAgoSec: 123,
     fallback: true,
     errors: [{ type: 'empty', stage: 'siri_ride_stops' }]
-  }, keys);
+  }, keys, { status: 'ready', stopCount: 966, scheduleCount: 1, routeCount: 2, snapshotBytes: 122880 });
   assert.strictEqual(dict[keys.ReqType], 6);
   assert.strictEqual(dict[keys.Status], 0);
   assert.strictEqual(dict[keys.DebugLine0], 'ep gtfs_ride_stops');
   assert.strictEqual(dict[keys.DebugLine1], 'stage scheduled_fallback http 200');
   assert.strictEqual(dict[keys.DebugLine2], 'rows 2 src cache age 123s');
-  assert.strictEqual(dict[keys.DebugLine3], 'fb yes err empty siri_ride_stops');
+  assert.strictEqual(dict[keys.DebugLine3], 'gtfs ready s966 q1 r2 120k');
 }
 
 function testProviderBackoffErrorPolicy() {
@@ -482,61 +473,70 @@ function testProviderBackoffErrorPolicy() {
   assert.strictEqual(core.shouldBackoffProviderError({ type: 'timeout' }), false);
 }
 
-async function testGetArrivalsForStopUsesBusGovBeforeOpenBusLookup() {
+async function testGetArrivalsForStopFallsBackFromCurlbusToOpenBus() {
   const originalFetch = global.fetch;
   const storage = core.memoryStorage();
   const settings = core.parseSettings({ MaxArrivals: 8 }, storage);
-  let busGovCalled = false;
+  const seenUrls = [];
 
   global.fetch = function(url) {
     const textUrl = String(url);
+    seenUrls.push(textUrl);
     if (textUrl.indexOf('curlbus.app') !== -1) {
       return Promise.resolve({
         status: 200,
         text: () => Promise.resolve(JSON.stringify({ visits: { 20004: [] } }))
       });
     }
-    if (textUrl.indexOf('bus.gov.il') !== -1) {
-      busGovCalled = true;
+    if (textUrl.indexOf('/gtfs_stops/list') !== -1) {
       return Promise.resolve({
         status: 200,
         text: () => Promise.resolve(JSON.stringify([
-          {
-            Shilut: '501',
-            DestinationQuarterName: 'Ra\'anana Terminal Junction',
-            CompanyName: 'Metropoline',
-            MinutesToArrivalList: [1, 14]
-          }
+          { id: '1:29310', code: 20004, name: 'HaMasger', gtfs_date: '2026-06-28' }
         ]))
       });
     }
-    if (textUrl.indexOf('/gtfs_stops/list') !== -1) {
-      return Promise.reject(new Error('OpenBus stop lookup should not block bus.gov live'));
+    if (textUrl.indexOf('/siri_stops/list') !== -1) {
+      return Promise.resolve({
+        status: 200,
+        text: () => Promise.resolve(JSON.stringify([{ id: 580, code: 20004 }]))
+      });
+    }
+    if (textUrl.indexOf('/siri_ride_stops/list') !== -1) {
+      return Promise.resolve({
+        status: 200,
+        text: () => Promise.resolve(JSON.stringify([{
+          gtfs_route__route_short_name: '501',
+          gtfs_route__route_long_name: 'Ra\'anana Terminal Junction',
+          gtfs_ride_stop__arrival_time: new Date(Date.now() + 3 * 60 * 1000).toISOString(),
+          nearest_siri_vehicle_location__recorded_at_time: new Date().toISOString()
+        }]))
+      });
     }
     return Promise.reject(new Error('Unexpected fetch ' + textUrl));
   };
 
   try {
     const result = await core.getArrivalsForStop(storage, { code: 20004, name: 'HaMasger' }, settings);
-    assert.strictEqual(busGovCalled, true);
-    assert.strictEqual(result.meta.source, 'live');
-    assert.strictEqual(result.rows.length, 2);
+    assert.strictEqual(seenUrls.some((url) => url.indexOf('bus.gov.il') !== -1), false);
+    assert.strictEqual(result.meta.source, 'siri');
+    assert.strictEqual(result.rows.length, 1);
     assert.strictEqual(result.rows[0].line, '501');
-    assert.strictEqual(result.rows[0].minutes, 1);
   } finally {
     global.fetch = originalFetch;
   }
 }
 
-async function testGetArrivalsForStopUsesCurlbusBeforeBusGov() {
+async function testGetArrivalsForStopRequestsCurlbusJson() {
   const originalFetch = global.fetch;
   const storage = core.memoryStorage();
   const settings = core.parseSettings({ MaxArrivals: 8 }, storage);
-  let busGovCalled = false;
+  let curlbusRequestOptions;
 
-  global.fetch = function(url) {
+  global.fetch = function(url, options) {
     const textUrl = String(url);
     if (textUrl.indexOf('curlbus.app') !== -1) {
+      curlbusRequestOptions = options;
       const soon = new Date(Date.now() + 60 * 1000).toISOString();
       const later = new Date(Date.now() + 4 * 60 * 1000).toISOString();
       return Promise.resolve({
@@ -561,16 +561,12 @@ async function testGetArrivalsForStopUsesCurlbusBeforeBusGov() {
         }))
       });
     }
-    if (textUrl.indexOf('bus.gov.il') !== -1) {
-      busGovCalled = true;
-      return Promise.reject(new Error('bus.gov should not be called when curlbus has rows'));
-    }
     return Promise.reject(new Error('Unexpected fetch ' + textUrl));
   };
 
   try {
     const result = await core.getArrivalsForStop(storage, { code: 20004, name: 'HaMasger' }, settings);
-    assert.strictEqual(busGovCalled, false);
+    assert.deepStrictEqual(curlbusRequestOptions.headers, { Accept: 'application/json' });
     assert.strictEqual(result.meta.source, 'live');
     assert.strictEqual(result.meta.diagnostics.endpoint, 'curlbus');
     assert.strictEqual(result.rows[0].line, '47');
@@ -611,8 +607,8 @@ async function testGetArrivalsFallsBackToScheduledRows() {
 
   global.fetch = function(url) {
     const textUrl = String(url);
-    if (textUrl.indexOf('bus.gov.il') !== -1) {
-      return Promise.resolve({ status: 200, text: () => Promise.resolve('[]') });
+    if (textUrl.indexOf('curlbus.app') !== -1) {
+      return Promise.resolve({ status: 200, text: () => Promise.resolve('{"visits":[]}') });
     }
     if (textUrl.indexOf('/gtfs_stops/list') !== -1) {
       return Promise.resolve({
@@ -685,7 +681,7 @@ async function testProviderAuthAndRateStatusesWithoutCache() {
   async function runStatus(httpStatus, expectedStatus) {
     const storage = core.memoryStorage();
     global.fetch = function(url) {
-      if (String(url).indexOf('bus.gov.il') !== -1) {
+      if (String(url).indexOf('curlbus.app') !== -1) {
         return Promise.resolve({ status: httpStatus, text: () => Promise.resolve('provider denied') });
       }
       return Promise.reject(new Error('Should not retry non-cache fallback after provider backoff'));
@@ -716,7 +712,7 @@ async function testProviderAuthUsesCacheWhenAvailable() {
   }));
 
   global.fetch = function(url) {
-    if (String(url).indexOf('bus.gov.il') !== -1) {
+    if (String(url).indexOf('curlbus.app') !== -1) {
       return Promise.resolve({ status: 403, text: () => Promise.resolve('provider denied') });
     }
     return Promise.reject(new Error('Unexpected fetch ' + url));
@@ -754,30 +750,102 @@ async function testActiveRateBackoffStatusAndCache() {
   assert.strictEqual(result.rows[0].line, '7');
 }
 
-async function testFetchStopIndexByCityWritesMetadata() {
+async function testStaticQueriesUsePhoneCache() {
   const originalFetch = global.fetch;
   const storage = core.memoryStorage();
+  const now = new Date();
+  transitCache.writeSnapshot(storage, transitCache.createSnapshot({
+    status: 'ready',
+    savedAt: now.getTime(),
+    stations: [
+      { code: 20004, name: 'HaMasger', city: 'Tel Aviv-Yafo', lat: 32.061291, lon: 34.784847 },
+      { code: 23017, name: 'Israel Tal', city: 'Tel Aviv-Yafo', lat: 32.063, lon: 34.786 }
+    ]
+  }));
+  transitCache.putSchedule(storage, 20004, [{
+    gtfs_stop__code: 20004,
+    gtfs_route__route_short_name: '47',
+    gtfs_route__route_long_name: 'Ra\'anana Terminal',
+    gtfs_route__line_ref: 7700,
+    arrival_time: new Date(now.getTime() + 5 * 60 * 1000).toISOString()
+  }], now.getTime());
+  transitCache.putRoute(storage, {
+    routeRef: 7700,
+    line: '47',
+    stops: [{ code: 20004, name: 'HaMasger' }, { code: 23017, name: 'Israel Tal' }]
+  }, now.getTime());
 
+  let fetches = [];
   global.fetch = function(url) {
-    assert(String(url).indexOf('/gtfs_stops/list') !== -1);
-    return Promise.resolve({
-      status: 200,
-      text: () => Promise.resolve(JSON.stringify([
-        { id: 1, code: 20004, name: 'HaMasger', city: 'Tel Aviv-Yafo', lat: 32.061291, lon: 34.784847 },
-        { id: 2, code: 0, name: 'Bad', city: 'Tel Aviv-Yafo', lat: 0, lon: 0 }
-      ]))
-    });
+    fetches.push(String(url));
+    if (String(url).indexOf('curlbus.app') !== -1) return Promise.reject(new Error('offline'));
+    return Promise.reject(new Error('unexpected static request ' + url));
   };
 
   try {
-    const stops = await core.fetchStopIndexByCity(storage, 'Tel Aviv-Yafo');
-    assert.strictEqual(stops.length, 1);
-    const meta = JSON.parse(storage.getItem(core.STORAGE.stopIndexMeta));
-    assert.strictEqual(meta.city, 'Tel Aviv-Yafo');
-    assert.strictEqual(meta.source, 'openbus_gtfs_stops');
-    assert.strictEqual(meta.count, 1);
-    assert(meta.savedAt > 0);
-    assert(meta.expiresAt >= meta.savedAt);
+    const stop = await core.getStopByCode(20004, storage);
+    assert.strictEqual(stop.name, 'HaMasger');
+
+    const route = await core.getRouteStops(7700, 20004, now, '47', storage);
+    assert.strictEqual(route.currentIndex, 0);
+    assert.strictEqual(route.stops[1].code, 23017);
+
+    const settings = core.parseSettings({ MaxArrivals: 8 }, storage);
+    const arrivals = await core.getArrivalsForStop(storage, stop, settings);
+    assert.strictEqual(arrivals.meta.source, 'scheduled');
+    assert.strictEqual(arrivals.rows[0].line, '47');
+    assert.strictEqual(fetches.length, 1);
+    assert(fetches[0].indexOf('curlbus.app') !== -1);
+  } finally {
+    global.fetch = originalFetch;
+  }
+}
+
+async function testNearbyWarmCachesSchedulesAndCompleteCrossCityRoutes() {
+  const originalFetch = global.fetch;
+  const storage = core.memoryStorage();
+  const now = new Date('2026-07-10T08:00:00+03:00');
+  const urls = [];
+  global.fetch = function(url) {
+    const textUrl = String(url);
+    urls.push(textUrl);
+    if (textUrl.indexOf('gtfs_ride_ids=123') !== -1) {
+      return Promise.resolve({
+        status: 200,
+        text: () => Promise.resolve(JSON.stringify([
+          { gtfs_stop__code: 20004, gtfs_stop__name: 'HaMasger', gtfs_stop__city: 'Tel Aviv-Yafo', stop_sequence: 1 },
+          { gtfs_stop__code: 23017, gtfs_stop__name: 'Israel Tal', gtfs_stop__city: 'Ramat Gan', stop_sequence: 2 }
+        ]))
+      });
+    }
+    if (textUrl.indexOf('/gtfs_ride_stops/list') !== -1) {
+      return Promise.resolve({
+        status: 200,
+        text: () => Promise.resolve(JSON.stringify([{
+          gtfs_ride_id: 123,
+          gtfs_stop__code: 20004,
+          gtfs_route__route_short_name: '47',
+          gtfs_route__line_ref: 7700,
+          arrival_time: '2026-07-10T09:00:00+03:00'
+        }]))
+      });
+    }
+    return Promise.reject(new Error('unexpected nearby warm request ' + textUrl));
+  };
+
+  try {
+    const status = await core.warmNearbyTransitCache(storage, [
+      { code: 20004, name: 'HaMasger', lat: 32.061291, lon: 34.784847 }
+    ], { favorite_lines: [] }, now);
+    assert.strictEqual(status.stationCount, 1);
+    assert.strictEqual(status.scheduleCount, 1);
+    assert.strictEqual(status.routeCount, 1);
+    assert.strictEqual(transitCache.findStop(storage, 20004).name, 'HaMasger');
+    assert.strictEqual(transitCache.getSchedule(storage, 20004).length, 1);
+    const route = transitCache.getRoute(storage, 7700, 20004, '47');
+    assert.strictEqual(route.stops.length, 2);
+    assert.strictEqual(route.stops[1].city, 'Ramat Gan');
+    assert.strictEqual(urls.some((url) => url.indexOf('/gtfs_stops/list') !== -1), false);
   } finally {
     global.fetch = originalFetch;
   }
@@ -786,19 +854,16 @@ async function testFetchStopIndexByCityWritesMetadata() {
 async function main() {
   testNormalizeSiriRows();
   testNormalizeScheduledRows();
-  testNormalizeBusGovRows();
   testFavoriteLineOperatorMatching();
-  testBusGovLiveFixture();
   testCurlbusLiveFixture();
-  testNearbyStops();
   testPackArrivalRows();
   testOperatorColorPacking();
   testParseSettingsRecoversFromCorruptJson();
-  testDefaultSettingsUseTelAvivStop();
+  testDefaultSettingsDoNotUseCityIndex();
   testStoredFavoriteStopsStayAsConfigured();
   testApplyConfigValuesAcceptsClayRawShape();
   testFavoriteLinesJsonPreservesOperator();
-  testForceStopIndexRefreshOnlyClearsStopIndex();
+  testConfigDoesNotExposeCityCaching();
   testToggleFavoriteLinePersistsAndRemoves();
   testExplicitFavoriteStopsOverrideStoredStops();
   testMemoryStorageKeyIteration();
@@ -809,15 +874,17 @@ async function main() {
   testPackStopsCarriesDefaultScreenSummary();
   testPackDiagnostics();
   testProviderBackoffErrorPolicy();
-  await testGetArrivalsForStopUsesCurlbusBeforeBusGov();
-  await testGetArrivalsForStopUsesBusGovBeforeOpenBusLookup();
+  await testGetAndPackRouteStops();
+  await testGetArrivalsForStopRequestsCurlbusJson();
+  await testGetArrivalsForStopFallsBackFromCurlbusToOpenBus();
   await testFetchBusNearbyStopsUsesEnglishByDefault();
   await testGetArrivalsFallsBackToScheduledRows();
   await testGetArrivalsFallsBackToCacheOnProviderFailure();
   await testProviderAuthAndRateStatusesWithoutCache();
   await testProviderAuthUsesCacheWhenAvailable();
   await testActiveRateBackoffStatusAndCache();
-  await testFetchStopIndexByCityWritesMetadata();
+  await testStaticQueriesUsePhoneCache();
+  await testNearbyWarmCachesSchedulesAndCompleteCrossCityRoutes();
   console.log('core tests passed');
 }
 

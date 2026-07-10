@@ -10,14 +10,18 @@ typedef struct {
   StopRow *favorite_stops;
   StopRow *nearby_stops;
   ArrivalRow *arrivals;
+  RouteStopRow *route_stops;
   char (*debug_lines)[64];
   uint8_t *manual_digits;
   uint8_t *favorite_count;
   uint8_t *nearby_count;
   uint8_t *arrival_count;
+  uint8_t *route_stop_count;
+  uint8_t *route_current_index;
   uint8_t *debug_count;
   int32_t *selected_stop_code;
   char *selected_stop_name;
+  char *route_line;
   uint8_t *source;
   char *notice;
   NoticeKind *notice_kind;

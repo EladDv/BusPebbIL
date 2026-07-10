@@ -5,6 +5,7 @@
 #define MAX_FAVORITES 8
 #define MAX_STOP_ITEMS 12
 #define MAX_ARRIVAL_ITEMS 24
+#define MAX_ROUTE_STOP_ITEMS 64
 #define STOP_CODE_DIGITS 5
 
 #define REQ_ARRIVALS 1
@@ -13,6 +14,7 @@
 #define REQ_FAVORITE_LINE 4
 #define REQ_SYNC_SETTINGS 5
 #define REQ_DEBUG 6
+#define REQ_ROUTE_STOPS 7
 
 #define STATUS_OK 0
 #define STATUS_NO_PHONE 30
@@ -32,6 +34,7 @@
 #define PERSIST_CACHE_MIN_BASE 160
 #define PERSIST_CACHE_DELAY_BASE 190
 #define PERSIST_CACHE_FLAGS_BASE 220
+#define PERSIST_CACHE_ROUTE_BASE 250
 #define PERSIST_FAV_COUNT 300
 #define PERSIST_FAV_CODE_BASE 310
 #define PERSIST_FAV_DIST_BASE 320
@@ -92,7 +95,8 @@ typedef enum {
   ScreenArrivals,
   ScreenStopCode,
   ScreenTutorial,
-  ScreenDebug
+  ScreenDebug,
+  ScreenRouteStops
 } AppScreen;
 
 typedef struct {
@@ -102,9 +106,15 @@ typedef struct {
 } StopRow;
 
 typedef struct {
+  char name[64];
+  int32_t code;
+} RouteStopRow;
+
+typedef struct {
   char line[64];
   char dest[64];
   int32_t minutes;
   int32_t delay_min;
   int32_t flags;
+  int32_t route_ref;
 } ArrivalRow;

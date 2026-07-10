@@ -30,6 +30,13 @@ K = {
     "RefreshSec": 10168,
     "DebugEnabled": 10172,
     "DarkMode": 10173,
+    "ArrivalRoute0": 10178,
+    "ArrivalRoute1": 10179,
+    "RouteRef": 10202,
+    "RouteCurrentIndex": 10203,
+    "RouteStopName0": 10204,
+    "RouteStopCount": 10268,
+    "RouteStopCode0": 10269,
 }
 
 
@@ -68,9 +75,9 @@ def screenshot(platform, out, name):
     return path
 
 
-def click(platform, button):
+def click(platform, button, delay=1.5):
     run(["pebble", "emu-button", "--emulator", platform, "click", button])
-    time.sleep(1.5)
+    time.sleep(delay)
 
 
 def main():
@@ -83,13 +90,18 @@ def main():
     if not out.is_absolute():
         out = ROOT / out
     out.mkdir(parents=True, exist_ok=True)
+    for old_screenshot in out.glob("*.png"):
+        old_screenshot.unlink()
     pbw = ROOT / "build" / "BusPebbIL.pbw"
     if not pbw.exists():
         raise SystemExit("build/BusPebbIL.pbw is missing; run pebble build first")
 
+    run_optional(["pebble", "kill", "--force"])
+    run_optional(["pebble", "wipe"])
     run_optional(["pebble", "emu-set-content-size", "--emulator", args.platform, "medium"])
     run(["pebble", "install", "--emulator", args.platform, str(pbw)])
     time.sleep(1)
+    click(args.platform, "back", 0.2)
 
     send(
         args.platform,
@@ -106,7 +118,7 @@ def main():
     )
     screenshot(args.platform, out, "01-settings-home.png")
 
-    click(args.platform, "select")
+    click(args.platform, "select", 0.1)
     send(
         args.platform,
         {
@@ -120,6 +132,8 @@ def main():
             K["DelayMin1"]: 0,
             K["Flags0"]: 8,
             K["Flags1"]: 0,
+            K["ArrivalRoute0"]: 7700,
+            K["ArrivalRoute1"]: 11767,
         },
         {
             K["Line0"]: "26",
@@ -159,6 +173,8 @@ def main():
             K["DelayMin1"]: 0,
             K["Flags0"]: 8,
             K["Flags1"]: 0,
+            K["ArrivalRoute0"]: 7700,
+            K["ArrivalRoute1"]: 11767,
         },
         {
             K["Line0"]: "26",
@@ -169,42 +185,55 @@ def main():
     )
     screenshot(args.platform, out, "04-arrivals-live.png")
 
-    full_ints = {
-        K["ReqType"]: 1,
-        K["Status"]: 0,
-        K["Source"]: 1,
-        K["UpdatedAgoSec"]: 0,
-    }
-    full_strings = {}
-    for i in range(24):
-        full_ints[K["Minutes0"] + i] = i + 1
-        full_ints[K["DelayMin0"] + i] = 0
-        full_ints[K["Flags0"] + i] = 0
-        full_strings[K["Line0"] + i] = str(100 + i)
-        full_strings[K["Dest0"] + i] = "Terminal " + str(i)
-    send(args.platform, full_ints, full_strings)
-    screenshot(args.platform, out, "05-arrivals-24.png")
-
+    click(args.platform, "select", 0.1)
+    send(
+        args.platform,
+        {
+            K["ReqType"]: 7,
+            K["Status"]: 0,
+            K["RouteRef"]: 7700,
+            K["RouteCurrentIndex"]: 2,
+            K["RouteStopCount"]: 5,
+            K["RouteStopCode0"]: 21256,
+            K["RouteStopCode0"] + 1: 21257,
+            K["RouteStopCode0"] + 2: 20004,
+            K["RouteStopCode0"] + 3: 23017,
+            K["RouteStopCode0"] + 4: 21604,
+        },
+        {
+            K["RouteStopName0"]: "Central Station",
+            K["RouteStopName0"] + 1: "HaRakevet/Bne Brak",
+            K["RouteStopName0"] + 2: "HaMasger/Yad Harutsim",
+            K["RouteStopName0"] + 3: "HaMasger/Israel Tal",
+            K["RouteStopName0"] + 4: "Azrieli Center",
+        },
+    )
+    screenshot(args.platform, out, "05-route-current.png")
+    click(args.platform, "down")
+    screenshot(args.platform, out, "06-route-current-unselected.png")
+    click(args.platform, "down")
+    screenshot(args.platform, out, "06b-route-scrolled.png")
+    click(args.platform, "up")
+    click(args.platform, "select", 0.1)
     send(
         args.platform,
         {
             K["ReqType"]: 1,
             K["Status"]: 0,
-            K["Source"]: 3,
-            K["UpdatedAgoSec"]: 480,
+            K["Source"]: 1,
+            K["UpdatedAgoSec"]: 0,
             K["Minutes0"]: 4,
             K["DelayMin0"]: 0,
             K["Flags0"]: 0,
+            K["ArrivalRoute0"]: 8123,
         },
-        {K["Line0"]: "5", K["Dest0"]: "Cached row"},
+        {K["Line0"]: "5", K["Dest0"]: "Central Station"},
     )
-    screenshot(args.platform, out, "06-arrivals-cached.png")
-
-    send(args.platform, {K["ReqType"]: 1, K["Status"]: 33, K["Source"]: 0, K["UpdatedAgoSec"]: 0})
-    screenshot(args.platform, out, "07-api-auth-error.png")
-
-    send(args.platform, {K["ReqType"]: 1, K["Status"]: 34, K["Source"]: 0, K["UpdatedAgoSec"]: 0})
-    screenshot(args.platform, out, "08-rate-limited.png")
+    screenshot(args.platform, out, "07-route-station-arrivals.png")
+    click(args.platform, "back")
+    screenshot(args.platform, out, "08-back-restores-route.png")
+    click(args.platform, "back")
+    screenshot(args.platform, out, "09-back-restores-origin-arrivals.png")
 
     print("Saved emulator smoke screenshots:")
     for path in sorted(out.glob("*.png")):

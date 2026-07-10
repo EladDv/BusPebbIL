@@ -1,4 +1,5 @@
 #include <pebble.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "BusPebbIL.h"
@@ -15,11 +16,14 @@ static AppScreen s_screen = ScreenHome;
 static StopRow s_favorite_stops[MAX_FAVORITES];
 static StopRow s_nearby_stops[MAX_STOP_ITEMS];
 static ArrivalRow s_arrivals[MAX_ARRIVAL_ITEMS];
+static RouteStopRow s_route_stops[MAX_ROUTE_STOP_ITEMS];
 static char s_debug_lines[4][64];
 static uint8_t s_manual_digits[STOP_CODE_DIGITS];
 static uint8_t s_favorite_count;
 static uint8_t s_nearby_count;
 static uint8_t s_arrival_count;
+static uint8_t s_route_stop_count;
+static uint8_t s_route_current_index;
 static uint8_t s_debug_count;
 static int32_t s_selected_stop_code;
 static char s_selected_stop_name[64];
@@ -28,6 +32,7 @@ static int32_t s_updated_ago_sec;
 static int32_t s_refresh_sec = 30;
 static AppScreen s_arrivals_back_screen = ScreenHome;
 static MenuIndex s_arrivals_back_index = { .section = 0, .row = 0 };
+static char s_route_line[64];
 static char s_notice[64] = "Starting...";
 static NoticeKind s_notice_kind = NoticeInfo;
 static uint8_t s_tutorial_page;
@@ -37,6 +42,25 @@ static bool s_settings_syncing;
 static bool s_apply_default_screen_on_settings;
 static bool s_dark_mode;
 static bool s_show_tutorial;
+static int s_pending_data_request;
+
+#define NAVIGATION_STACK_MAX 4
+
+typedef struct {
+  AppScreen screen;
+  MenuIndex selected_index;
+  int32_t stop_code;
+  char stop_name[64];
+  AppScreen arrivals_back_screen;
+  MenuIndex arrivals_back_index;
+  uint8_t source;
+  int32_t updated_ago_sec;
+  uint8_t arrival_count;
+  ArrivalRow *arrivals;
+} NavigationFrame;
+
+static NavigationFrame s_navigation_stack[NAVIGATION_STACK_MAX];
+static uint8_t s_navigation_depth;
 
 static BusPebbILUiState s_ui = {
   .menu_layer = &s_menu_layer,
@@ -44,14 +68,18 @@ static BusPebbILUiState s_ui = {
   .favorite_stops = s_favorite_stops,
   .nearby_stops = s_nearby_stops,
   .arrivals = s_arrivals,
+  .route_stops = s_route_stops,
   .debug_lines = s_debug_lines,
   .manual_digits = s_manual_digits,
   .favorite_count = &s_favorite_count,
   .nearby_count = &s_nearby_count,
   .arrival_count = &s_arrival_count,
+  .route_stop_count = &s_route_stop_count,
+  .route_current_index = &s_route_current_index,
   .debug_count = &s_debug_count,
   .selected_stop_code = &s_selected_stop_code,
   .selected_stop_name = s_selected_stop_name,
+  .route_line = s_route_line,
   .source = &s_source,
   .notice = s_notice,
   .notice_kind = &s_notice_kind,
@@ -64,6 +92,7 @@ static void request_arrivals(int32_t stop_code, const char *stop_name);
 static void request_settings(void);
 static void request_stop_code(void);
 static void request_debug(void);
+static void request_route_stops(uint16_t row);
 static void update_screen_notice(void);
 static void start_loading_timer(void);
 static void cancel_loading_timer(void);
@@ -192,6 +221,78 @@ static void set_selected_stop_name(int32_t stop_code, const char *stop_name) {
   ui_screens_reset_marquee();
 }
 
+static bool push_navigation_screen(void) {
+  if (s_navigation_depth >= NAVIGATION_STACK_MAX) return false;
+
+  NavigationFrame *frame = &s_navigation_stack[s_navigation_depth];
+  memset(frame, 0, sizeof(*frame));
+  frame->screen = s_screen;
+  frame->selected_index = s_menu_layer ? menu_layer_get_selected_index(s_menu_layer) :
+                                         (MenuIndex) { .section = 0, .row = 0 };
+  frame->stop_code = s_selected_stop_code;
+  snprintf(frame->stop_name, sizeof(frame->stop_name), "%s", s_selected_stop_name);
+  frame->arrivals_back_screen = s_arrivals_back_screen;
+  frame->arrivals_back_index = s_arrivals_back_index;
+
+  if (s_screen == ScreenArrivals && s_arrival_count) {
+    frame->arrivals = malloc(sizeof(ArrivalRow) * s_arrival_count);
+    if (!frame->arrivals) return false;
+    memcpy(frame->arrivals, s_arrivals, sizeof(ArrivalRow) * s_arrival_count);
+    frame->arrival_count = s_arrival_count;
+    frame->source = s_source;
+    frame->updated_ago_sec = s_updated_ago_sec;
+  }
+
+  s_navigation_depth += 1;
+  return true;
+}
+
+static bool pop_navigation_screen(void) {
+  if (!s_navigation_depth) return false;
+
+  NavigationFrame *frame = &s_navigation_stack[s_navigation_depth - 1];
+  MenuIndex selected_index = frame->selected_index;
+  cancel_refresh_timer();
+  cancel_loading_timer();
+  s_loading = false;
+  s_pending_data_request = 0;
+  s_screen = frame->screen;
+  s_selected_stop_code = frame->stop_code;
+  set_selected_stop_name(frame->stop_code, frame->stop_name);
+  s_arrivals_back_screen = frame->arrivals_back_screen;
+  s_arrivals_back_index = frame->arrivals_back_index;
+
+  if (frame->screen == ScreenArrivals) {
+    s_arrival_count = frame->arrival_count;
+    if (frame->arrivals && frame->arrival_count) {
+      memcpy(s_arrivals, frame->arrivals, sizeof(ArrivalRow) * frame->arrival_count);
+    }
+    s_source = frame->source;
+    s_updated_ago_sec = frame->updated_ago_sec;
+  }
+
+  free(frame->arrivals);
+  memset(frame, 0, sizeof(*frame));
+  s_navigation_depth -= 1;
+  ui_screens_restart_marquee(&s_ui);
+  update_screen_notice();
+  if (s_menu_layer) {
+    menu_layer_reload_data(s_menu_layer);
+    menu_layer_set_selected_index(s_menu_layer, selected_index, MenuRowAlignCenter, false);
+  }
+  schedule_refresh_timer();
+  return true;
+}
+
+static void clear_navigation_stack(void) {
+  while (s_navigation_depth) {
+    NavigationFrame *frame = &s_navigation_stack[s_navigation_depth - 1];
+    free(frame->arrivals);
+    memset(frame, 0, sizeof(*frame));
+    s_navigation_depth -= 1;
+  }
+}
+
 static bool load_cached_arrivals(int32_t stop_code, const char *stop_name) {
   if (!persist_exists(PERSIST_CACHE_COUNT) || !persist_exists(PERSIST_CACHE_STOP_CODE)) {
     return false;
@@ -226,6 +327,8 @@ static bool load_cached_arrivals(int32_t stop_code, const char *stop_name) {
     s_arrivals[s_arrival_count].minutes = minutes > 0 ? minutes : 0;
     s_arrivals[s_arrival_count].delay_min = persist_read_int(PERSIST_CACHE_DELAY_BASE + i);
     s_arrivals[s_arrival_count].flags = persist_read_int(PERSIST_CACHE_FLAGS_BASE + i);
+    s_arrivals[s_arrival_count].route_ref = persist_exists(PERSIST_CACHE_ROUTE_BASE + i) ?
+                                             persist_read_int(PERSIST_CACHE_ROUTE_BASE + i) : 0;
     s_arrival_count += 1;
   }
   if (!s_arrival_count) {
@@ -261,6 +364,12 @@ static void loading_timeout_callback(void *data) {
     return;
   }
   s_loading = false;
+  s_pending_data_request = 0;
+  if (s_screen == ScreenRouteStops) {
+    pop_navigation_screen();
+    set_status_colored("Route timeout", ui_color_red(), GColorWhite);
+    return;
+  }
   if (s_screen == ScreenArrivals && load_cached_arrivals(s_selected_stop_code, s_selected_stop_name)) {
     return;
   }
@@ -288,6 +397,7 @@ static void persist_arrivals_cache(void) {
     persist_write_int(PERSIST_CACHE_MIN_BASE + i, s_arrivals[i].minutes);
     persist_write_int(PERSIST_CACHE_DELAY_BASE + i, s_arrivals[i].delay_min);
     persist_write_int(PERSIST_CACHE_FLAGS_BASE + i, s_arrivals[i].flags);
+    persist_write_int(PERSIST_CACHE_ROUTE_BASE + i, s_arrivals[i].route_ref);
   }
 }
 
@@ -379,6 +489,19 @@ static bool send_request(int req_type, int32_t stop_code, const char *line, int 
   return true;
 }
 
+static bool send_route_request(int32_t route_ref, const char *line) {
+  DictionaryIterator *iter;
+  AppMessageResult result = app_message_outbox_begin(&iter);
+  if (result != APP_MSG_OK || !iter) return false;
+
+  int req_type = REQ_ROUTE_STOPS;
+  dict_write_int(iter, MESSAGE_KEY_ReqType, &req_type, sizeof(int), true);
+  dict_write_int32(iter, MESSAGE_KEY_StopCode, s_selected_stop_code);
+  dict_write_int32(iter, MESSAGE_KEY_RouteRef, route_ref);
+  dict_write_cstring(iter, MESSAGE_KEY_Line0, line);
+  return app_message_outbox_send() == APP_MSG_OK;
+}
+
 static void request_settings(void) {
   cancel_refresh_timer();
   s_apply_default_screen_on_settings = s_screen == ScreenHome;
@@ -419,7 +542,9 @@ static void request_arrivals(int32_t stop_code, const char *stop_name) {
     s_arrival_count = 0;
     set_loading("Checking");
   }
+  s_pending_data_request = REQ_ARRIVALS;
   if (!send_request(REQ_ARRIVALS, stop_code, NULL, 0)) {
+    s_pending_data_request = 0;
     if (!showing_cached_rows && !load_cached_arrivals(stop_code, stop_name)) {
       set_status("Phone disconnected");
     }
@@ -460,6 +585,44 @@ static void request_debug(void) {
   s_debug_count = 0;
   set_loading("Checking");
   send_request(REQ_DEBUG, 0, NULL, 0);
+}
+
+static void request_route_stops(uint16_t row) {
+  if (row >= s_arrival_count || !s_arrivals[row].line[0]) {
+    set_notice("Route unavailable", NoticeWarning);
+    return;
+  }
+  if (!push_navigation_screen()) {
+    set_notice("Navigation full", NoticeWarning);
+    return;
+  }
+
+  cancel_refresh_timer();
+  cancel_loading_timer();
+  snprintf(s_route_line, sizeof(s_route_line), "Line %s", s_arrivals[row].line);
+  s_route_stop_count = 0;
+  s_route_current_index = 0;
+  s_screen = ScreenRouteStops;
+  s_pending_data_request = REQ_ROUTE_STOPS;
+  ui_screens_restart_marquee(&s_ui);
+  set_loading("Loading route");
+  if (!send_route_request(s_arrivals[row].route_ref, s_arrivals[row].line)) {
+    s_pending_data_request = 0;
+    pop_navigation_screen();
+    set_notice("Phone disconnected", NoticeError);
+  }
+}
+
+static void open_route_stop(uint16_t row) {
+  if (row >= s_route_stop_count || !s_route_stops[row].code) {
+    set_notice("Station unavailable", NoticeWarning);
+    return;
+  }
+  if (!push_navigation_screen()) {
+    set_notice("Navigation full", NoticeWarning);
+    return;
+  }
+  request_arrivals(s_route_stops[row].code, s_route_stops[row].name);
 }
 
 static void set_default_favorites(void) {
@@ -514,6 +677,8 @@ static void update_screen_notice(void) {
     set_notice("Select stop  Long: save", NoticeInfo);
   } else if (s_screen == ScreenArrivals) {
     set_notice("No arrivals soon", NoticeWarning);
+  } else if (s_screen == ScreenRouteStops) {
+    set_notice("UP/DOWN  SELECT station", NoticeInfo);
   } else if (s_screen == ScreenStopCode) {
     set_notice("Select edits  Open row", NoticeInfo);
   } else if (s_screen == ScreenTutorial) {
@@ -544,7 +709,9 @@ static void menu_select_callback(MenuLayer *menu_layer, MenuIndex *cell_index, v
       request_nearby();
     }
   } else if (s_screen == ScreenArrivals) {
-    request_arrivals(s_selected_stop_code, s_selected_stop_name);
+    request_route_stops(row);
+  } else if (s_screen == ScreenRouteStops) {
+    open_route_stop(row);
   } else if (s_screen == ScreenStopCode) {
     if (row < STOP_CODE_DIGITS) {
       s_manual_digits[row] = (s_manual_digits[row] + 1) % 10;
@@ -579,7 +746,7 @@ static void menu_select_long_callback(MenuLayer *menu_layer, MenuIndex *cell_ind
   } else if (s_screen == ScreenArrivals && selected.row < s_arrival_count) {
     vibes_short_pulse();
     set_status("Toggling line...");
-    send_request(REQ_FAVORITE_LINE, 0, s_arrivals[selected.row].line, 0);
+    send_request(REQ_FAVORITE_LINE, s_selected_stop_code, s_arrivals[selected.row].line, 0);
   } else if (s_screen == ScreenHome && selected.row < s_favorite_count) {
     vibes_short_pulse();
     set_status("Removing stop...");
@@ -628,11 +795,18 @@ static void select_long_click_handler(ClickRecognizerRef recognizer, void *conte
 static void back_click_handler(ClickRecognizerRef recognizer, void *context) {
   if (s_screen == ScreenTutorial) {
     dismiss_tutorial();
+  } else if (s_screen == ScreenRouteStops) {
+    if (!pop_navigation_screen()) window_stack_pop(true);
   } else if (s_screen == ScreenArrivals || s_screen == ScreenNearby || s_screen == ScreenStopCode || s_screen == ScreenDebug) {
+    if (s_screen == ScreenArrivals && s_navigation_depth) {
+      pop_navigation_screen();
+      return;
+    }
     cancel_refresh_timer();
     cancel_loading_timer();
     s_loading = false;
     s_settings_syncing = false;
+    if (s_screen == ScreenArrivals) s_pending_data_request = 0;
     if (s_screen == ScreenArrivals &&
         (s_arrivals_back_screen == ScreenNearby || s_arrivals_back_screen == ScreenStopCode)) {
       s_screen = s_arrivals_back_screen;
@@ -685,7 +859,27 @@ static void parse_arrival_rows(DictionaryIterator *iter) {
     s_arrivals[s_arrival_count].minutes = tuple_int(iter, MESSAGE_KEY_Minutes0 + i, 0);
     s_arrivals[s_arrival_count].delay_min = tuple_int(iter, MESSAGE_KEY_DelayMin0 + i, 0);
     s_arrivals[s_arrival_count].flags = tuple_int(iter, MESSAGE_KEY_Flags0 + i, 0);
+    s_arrivals[s_arrival_count].route_ref = tuple_int(iter, MESSAGE_KEY_ArrivalRoute0 + i, 0);
     s_arrival_count += 1;
+  }
+}
+
+static void parse_route_stop_rows(DictionaryIterator *iter) {
+  int32_t count = tuple_int(iter, MESSAGE_KEY_RouteStopCount, 0);
+  if (count < 0) count = 0;
+  if (count > MAX_ROUTE_STOP_ITEMS) count = MAX_ROUTE_STOP_ITEMS;
+  s_route_stop_count = 0;
+  for (int32_t i = 0; i < count; i += 1) {
+    Tuple *name_tuple = dict_find(iter, MESSAGE_KEY_RouteStopName0 + i);
+    if (!name_tuple) continue;
+    snprintf(s_route_stops[s_route_stop_count].name,
+             sizeof(s_route_stops[s_route_stop_count].name), "%s", name_tuple->value->cstring);
+    s_route_stops[s_route_stop_count].code = tuple_int(iter, MESSAGE_KEY_RouteStopCode0 + i, 0);
+    s_route_stop_count += 1;
+  }
+  s_route_current_index = tuple_int(iter, MESSAGE_KEY_RouteCurrentIndex, 0);
+  if (s_route_stop_count && s_route_current_index >= s_route_stop_count) {
+    s_route_current_index = s_route_stop_count - 1;
   }
 }
 
@@ -701,10 +895,20 @@ static void parse_debug_rows(DictionaryIterator *iter) {
 }
 
 static void inbox_received_callback(DictionaryIterator *iter, void *context) {
+  bool focus_route_stops = false;
   int32_t status = tuple_int(iter, MESSAGE_KEY_Status, STATUS_OK);
   int32_t req_type = tuple_int(iter, MESSAGE_KEY_ReqType, 0);
-  s_source = tuple_int(iter, MESSAGE_KEY_Source, 0);
-  s_updated_ago_sec = tuple_int(iter, MESSAGE_KEY_UpdatedAgoSec, 0);
+  if ((req_type == REQ_ARRIVALS || req_type == REQ_ROUTE_STOPS) &&
+      req_type != s_pending_data_request) {
+    return;
+  }
+  if (req_type == REQ_ARRIVALS || req_type == REQ_ROUTE_STOPS) {
+    s_pending_data_request = 0;
+  }
+  if (req_type == REQ_ARRIVALS) {
+    s_source = tuple_int(iter, MESSAGE_KEY_Source, 0);
+    s_updated_ago_sec = tuple_int(iter, MESSAGE_KEY_UpdatedAgoSec, 0);
+  }
   bool apply_default_screen = req_type == REQ_SYNC_SETTINGS &&
                               s_apply_default_screen_on_settings &&
                               s_screen == ScreenHome;
@@ -725,13 +929,16 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
         s_updated_ago_sec = 0;
       }
     }
+    if (req_type == REQ_ROUTE_STOPS) pop_navigation_screen();
     clear_loading();
     if (status == 12) set_status_colored("GPS unavailable", ui_color_red(), GColorWhite);
     else if (status == STATUS_NO_DATA) set_status_colored("No provider data", ui_color_amber(), GColorBlack);
     else if (status == STATUS_API_AUTH) set_status_colored("API auth error", ui_color_red(), GColorWhite);
     else if (status == STATUS_RATE_LIMIT) set_status_colored("Rate limited", ui_color_red(), GColorWhite);
+    else if (req_type == REQ_ROUTE_STOPS) set_status_colored("Route unavailable", ui_color_red(), GColorWhite);
     else if (status == 10 || status == 11) set_status_colored("Data error", ui_color_red(), GColorWhite);
     else set_status_colored("Phone error", ui_color_red(), GColorWhite);
+    schedule_refresh_timer();
     return;
   }
 
@@ -790,21 +997,46 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
     parse_debug_rows(iter);
     s_screen = ScreenDebug;
     ui_screens_restart_marquee(&s_ui);
+  } else if (req_type == REQ_ROUTE_STOPS) {
+    parse_route_stop_rows(iter);
+    s_screen = ScreenRouteStops;
+    ui_screens_restart_marquee(&s_ui);
+    focus_route_stops = true;
   }
 
   clear_loading();
   update_screen_notice();
   schedule_refresh_timer();
+  if (focus_route_stops && s_route_stop_count) {
+    menu_layer_set_selected_index(s_menu_layer,
+                                  (MenuIndex) { .section = 0, .row = s_route_current_index },
+                                  MenuRowAlignCenter, false);
+  }
 }
 
 static void inbox_dropped_callback(AppMessageResult reason, void *context) {
+  s_pending_data_request = 0;
   clear_loading();
+  if (s_screen == ScreenRouteStops) {
+    pop_navigation_screen();
+  }
   set_status_colored("Message dropped", ui_color_red(), GColorWhite);
 }
 
 static void outbox_failed_callback(DictionaryIterator *iter, AppMessageResult reason, void *context) {
+  int32_t req_type = tuple_int(iter, MESSAGE_KEY_ReqType, 0);
+  if ((req_type == REQ_ARRIVALS || req_type == REQ_ROUTE_STOPS) &&
+      req_type != s_pending_data_request) {
+    return;
+  }
   s_settings_syncing = false;
+  if (req_type == REQ_ARRIVALS || req_type == REQ_ROUTE_STOPS) {
+    s_pending_data_request = 0;
+  }
   clear_loading();
+  if (req_type == REQ_ROUTE_STOPS && s_screen == ScreenRouteStops) {
+    pop_navigation_screen();
+  }
   if (s_screen == ScreenArrivals && load_cached_arrivals(s_selected_stop_code, s_selected_stop_name)) {
     return;
   }
@@ -868,6 +1100,7 @@ static void init(void) {
 }
 
 static void deinit(void) {
+  clear_navigation_stack();
   window_destroy(s_window);
 }
 

@@ -68,13 +68,6 @@ module.exports = [
           { label: '20 rows', value: '20' },
           { label: '24 rows', value: '24' }
         ]
-      },
-      {
-        type: 'input',
-        messageKey: 'NearbyCity',
-        label: 'Nearby city',
-        defaultValue: 'Tel Aviv-Yafo',
-        description: 'Used to cache a compact stop index for nearby search.'
       }
     ]
   },
@@ -188,13 +181,8 @@ module.exports = [
         type: 'toggle',
         messageKey: 'ClearCache',
         label: 'Clear cache on save',
-        defaultValue: false
-      },
-      {
-        type: 'toggle',
-        messageKey: 'ForceStopIndexRefresh',
-        label: 'Refresh stop index',
-        defaultValue: false
+        defaultValue: false,
+        description: 'Clears arrivals and the daily phone GTFS snapshot.'
       }
     ]
   },

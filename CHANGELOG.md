@@ -1,6 +1,8 @@
 # Changelog
 
-## Fixed
+## 1.4.0 - 2026-07-15
+
+### Fixed
 
 - Made route lookup bounded and route-reference-first so route navigation completes before the watch timeout.
 - Prevented ambiguous line-number fallbacks from selecting an unrelated operator's route.

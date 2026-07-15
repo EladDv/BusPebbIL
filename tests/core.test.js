@@ -204,7 +204,7 @@ async function testGetAndPackRouteStops() {
   global.fetch = function(url) {
     const textUrl = String(url);
     seenUrls.push(textUrl);
-    if (textUrl.indexOf('gtfs_route__line_refs=9999') !== -1) {
+    if (textUrl.indexOf('/gtfs_rides/list') !== -1 && textUrl.indexOf('gtfs_route__line_refs=9999') !== -1) {
       return Promise.resolve({
         status: 200,
         text: () => Promise.resolve('[]')
@@ -253,6 +253,75 @@ async function testGetAndPackRouteStops() {
     assert.strictEqual(packed[keys.RouteStopName0 + 1], 'HaMasger/Yad Haru...');
     assert.strictEqual(packed[keys.RouteStopCode0], 21256);
     assert.strictEqual(packed[keys.RouteStopCode0 + 1], 20004);
+  } finally {
+    global.fetch = originalFetch;
+  }
+}
+
+async function testRoute60UsesExactTelAvivRouteAndRejectsAmbiguity() {
+  const originalFetch = global.fetch;
+  const seenUrls = [];
+
+  global.fetch = function(url) {
+    const textUrl = String(url);
+    seenUrls.push(textUrl);
+    if (textUrl.indexOf('/gtfs_rides/list') !== -1 && textUrl.indexOf('gtfs_route__line_refs=2508') !== -1) {
+      return Promise.resolve({
+        status: 200,
+        text: () => Promise.resolve(JSON.stringify([{
+          gtfs_ride_id: 6001,
+          gtfs_route__line_ref: 2508,
+          gtfs_route__route_short_name: '60',
+          gtfs_route__agency_name: 'Dan',
+          gtfs_stop__code: 25702
+        }]))
+      });
+    }
+    if (textUrl.indexOf('gtfs_ride_ids=6001') !== -1) {
+      return Promise.resolve({
+        status: 200,
+        text: () => Promise.resolve(JSON.stringify([
+          { stop_sequence: 1, gtfs_stop__code: 25701, gtfs_stop__name: 'Tel Aviv Center', gtfs_stop__city: 'Tel Aviv-Yafo' },
+          { stop_sequence: 2, gtfs_stop__code: 25702, gtfs_stop__name: 'Tel Aviv Origin', gtfs_stop__city: 'Tel Aviv-Yafo' },
+          { stop_sequence: 3, gtfs_stop__code: 26001, gtfs_stop__name: 'Ramat Gan Center', gtfs_stop__city: 'Ramat Gan' }
+        ]))
+      });
+    }
+    return Promise.reject(new Error('Unexpected fetch ' + textUrl));
+  };
+
+  try {
+    const result = await core.getRouteStops(2508, 25702, new Date('2026-07-10T08:30:00+03:00'), '60');
+    assert.strictEqual(result.routeRef, 2508);
+    assert.strictEqual(result.currentIndex, 1);
+    assert.deepStrictEqual(result.stops.map((stop) => stop.city), ['Tel Aviv-Yafo', 'Tel Aviv-Yafo', 'Ramat Gan']);
+    assert.strictEqual(seenUrls.length, 2);
+    assert(seenUrls[0].indexOf('gtfs_route__line_refs=2508') !== -1);
+    assert(seenUrls[0].indexOf('arrival_time_from') === -1);
+    assert(seenUrls.every((url) => url.indexOf('gtfs_route__route_short_name=60') === -1));
+  } finally {
+    global.fetch = originalFetch;
+  }
+
+  global.fetch = function(url) {
+    const textUrl = String(url);
+    if (textUrl.indexOf('gtfs_route__route_short_name=60') !== -1) {
+      return Promise.resolve({
+        status: 200,
+        text: () => Promise.resolve(JSON.stringify([
+          { gtfs_ride_id: 6001, gtfs_route__line_ref: 2508, gtfs_route__agency_name: 'Dan', gtfs_stop__code: 25702 },
+          { gtfs_ride_id: 6002, gtfs_route__line_ref: 12241, gtfs_route__agency_name: 'Kavim', gtfs_stop__code: 25702 }
+        ]))
+      });
+    }
+    return Promise.reject(new Error('Unexpected fetch ' + textUrl));
+  };
+
+  try {
+    await assert.rejects(
+      core.getRouteStops(0, 25702, new Date('2026-07-10T08:30:00+03:00'), '60'),
+      (error) => error && error.type === 'ambiguous_route'
+    );
   } finally {
     global.fetch = originalFetch;
   }
@@ -875,6 +944,7 @@ async function main() {
   testPackDiagnostics();
   testProviderBackoffErrorPolicy();
   await testGetAndPackRouteStops();
+  await testRoute60UsesExactTelAvivRouteAndRejectsAmbiguity();
   await testGetArrivalsForStopRequestsCurlbusJson();
   await testGetArrivalsForStopFallsBackFromCurlbusToOpenBus();
   await testFetchBusNearbyStopsUsesEnglishByDefault();

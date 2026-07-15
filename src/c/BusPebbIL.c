@@ -381,7 +381,8 @@ static void loading_timeout_callback(void *data) {
 
 static void start_loading_timer(void) {
   cancel_loading_timer();
-  s_loading_timer = app_timer_register(LOADING_TIMEOUT_MS, loading_timeout_callback, NULL);
+  uint32_t timeout_ms = s_screen == ScreenRouteStops ? ROUTE_LOADING_TIMEOUT_MS : LOADING_TIMEOUT_MS;
+  s_loading_timer = app_timer_register(timeout_ms, loading_timeout_callback, NULL);
 }
 
 static void persist_arrivals_cache(void) {

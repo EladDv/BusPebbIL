@@ -971,11 +971,24 @@ function routeResultFromPayload(payload, candidate) {
     throw { type: 'not_found', stage: 'route_stops', routeRef: candidate.routeRef };
   }
   return {
+    rideId: intValue(candidate.rideId, 0),
     routeRef: candidate.routeRef,
     line: candidate.line,
+    direction: intValue(candidate.direction, 0),
+    alternative: String(candidate.alternative || ''),
     stops: stops,
     currentIndex: currentIndex
   };
+}
+
+function routeIdentity(row) {
+  var routeRef = intValue(row && (row.gtfs_route__line_ref || row.routeRef), 0);
+  if (routeRef) return 'ref:' + routeRef;
+  return [
+    String(firstValue(row, ['gtfs_route__agency_ref', 'gtfs_agency_id', 'gtfs_route__agency_name']) || ''),
+    String(firstValue(row, ['gtfs_route__direction', 'direction_id', 'direction']) || ''),
+    String(firstValue(row, ['gtfs_route__alternative', 'alternative']) || '')
+  ].join('|');
 }
 
 function fetchRoutePattern(candidate, now) {
@@ -989,50 +1002,88 @@ function fetchRoutePattern(candidate, now) {
     return Promise.reject({ type: 'invalid_route', routeRef: routeRef, stopCode: stopCode });
   }
 
-  function fetchRide(knownRideId) {
+  function fetchRide(knownRideId, resolvedRow) {
+    resolvedRow = resolvedRow || {};
     return apiGet('/gtfs_ride_stops/list', {
       gtfs_ride_ids: knownRideId,
       limit: 200,
       order_by: 'stop_sequence asc'
-    }, 6000).then(function(payload) {
-      return routeResultFromPayload(payload, { routeRef: routeRef, line: line, stopCode: stopCode });
+    }, 5000).then(function(payload) {
+      return routeResultFromPayload(payload, {
+        rideId: knownRideId,
+        routeRef: routeRef,
+        line: line,
+        stopCode: stopCode,
+        direction: firstValue(resolvedRow, ['gtfs_route__direction', 'direction_id', 'direction']),
+        alternative: firstValue(resolvedRow, ['gtfs_route__alternative', 'alternative'])
+      });
     });
   }
   if (rideId) return fetchRide(rideId);
 
-  function candidateParamsFor(windowTime, useLine) {
-    var params = {
+  function findRows(useLine) {
+    if (!useLine && routeRef) {
+      return apiGet('/gtfs_rides/list', {
+        gtfs_route__line_refs: routeRef,
+        limit: 8,
+        order_by: 'id desc'
+      }, 3000).then(asRows);
+    }
+    var windowStart = localDayStart(baseTime);
+    return apiGet('/gtfs_ride_stops/list', {
       gtfs_stop__code: stopCode,
-      arrival_time_from: isoWithOffset(addMinutes(windowTime, -30)),
-      arrival_time_to: isoWithOffset(addMinutes(windowTime, 180)),
+      arrival_time_from: isoWithOffset(windowStart),
+      arrival_time_to: isoWithOffset(addMinutes(windowStart, 24 * 60)),
+      gtfs_route__route_short_name: line,
       limit: 32,
-      order_by: 'arrival_time asc'
-    };
-    if (useLine || !routeRef) params.gtfs_route__route_short_name = line;
-    else params.gtfs_route__line_refs = routeRef;
-    return params;
+      order_by: 'arrival_time desc'
+    }, 3000).then(asRows);
   }
 
-  var daysAgo = 0;
-  function findCandidate() {
-    var windowTime = addMinutes(baseTime, -daysAgo * 24 * 60);
-    return apiGet('/gtfs_ride_stops/list', candidateParamsFor(windowTime, false), 5000).then(function(payload) {
-      var rows = asRows(payload);
-      if (rows.length || !routeRef || !line) return rows;
-      return apiGet('/gtfs_ride_stops/list', candidateParamsFor(windowTime, true), 5000).then(asRows);
-    }).then(function(rows) {
-      if (rows.length || daysAgo >= 7) return rows;
-      daysAgo += 1;
-      return findCandidate();
+  function tryRides(rows, index) {
+    if (index >= rows.length) return Promise.resolve(null);
+    var row = rows[index];
+    var candidateRideId = intValue(row && (row.gtfs_ride_id || row.id), 0);
+    if (!candidateRideId) return tryRides(rows, index + 1);
+    return fetchRide(candidateRideId, row).then(function(result) {
+      return result;
+    }, function(error) {
+      if (error && error.type === 'not_found' && error.stage === 'route_stops') {
+        return tryRides(rows, index + 1);
+      }
+      throw error;
     });
   }
 
-  return findCandidate().then(function(rows) {
+  return findRows(false).then(function(rows) {
+    if (routeRef && rows.length) {
+      return tryRides(rows, 0).then(function(result) {
+        if (result) return { result: result };
+        if (!line) return { rows: [] };
+        return findRows(true).then(function(fallbackRows) {
+          return { rows: fallbackRows, usedLine: true };
+        });
+      });
+    }
+    if (!routeRef || !line) return { rows: rows, usedLine: !routeRef };
+    return findRows(true).then(function(fallbackRows) {
+      return { rows: fallbackRows, usedLine: true };
+    });
+  }).then(function(foundRows) {
+    if (foundRows.result) return foundRows.result;
+    var rows = foundRows.rows || [];
+    if (foundRows.usedLine && rows.length) {
+      var identities = {};
+      rows.forEach(function(row) { identities[routeIdentity(row)] = true; });
+      if (Object.keys(identities).length > 1) {
+        throw { type: 'ambiguous_route', stage: 'route_ride', routeRef: routeRef, line: line };
+      }
+    }
     var found = rows[0];
-    rideId = found && intValue(found.gtfs_ride_id, 0);
+    rideId = found && intValue(found.gtfs_ride_id || found.id, 0);
     routeRef = found ? intValue(found.gtfs_route__line_ref, routeRef) : routeRef;
     if (!rideId) throw { type: 'not_found', stage: 'route_ride', routeRef: routeRef, line: line };
-    return fetchRide(rideId);
+    return fetchRide(rideId, found);
   });
 }
 

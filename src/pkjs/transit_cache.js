@@ -24,7 +24,7 @@ function createSnapshot(values) {
     version: SNAPSHOT_VERSION,
     status: status,
     savedAt: savedAt,
-    expiresAt: Number(values.expiresAt || (savedAt ? savedAt + DAY_MS : 0)),
+    expiresAt: Number(values.expiresAt !== undefined ? values.expiresAt : (savedAt ? savedAt + DAY_MS : 0)),
     stations: values.stations || values.visited || [],
     schedules: values.schedules || {},
     routes: values.routes || {},
@@ -153,21 +153,47 @@ function getSchedule(storage, code) {
   return entry && entry.rows ? entry.rows : [];
 }
 
+function routePatternFingerprint(route) {
+  var hash = 2166136261;
+  var text = (route && route.stops || []).map(stopCode).join(',');
+  for (var i = 0; i < text.length; i += 1) {
+    hash ^= text.charCodeAt(i);
+    hash += (hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24);
+  }
+  return (hash >>> 0).toString(36);
+}
+
 function routeKey(route) {
   var routeRef = Number(route && route.routeRef || 0);
-  if (routeRef) return 'ref:' + routeRef;
-  return 'line:' + String(route && route.line || '');
+  var identity = routeRef ? 'ref:' + routeRef : 'line:' + String(route && route.line || '');
+  return identity + ':pattern:' + routePatternFingerprint(route);
+}
+
+function removeOlderRoutePatterns(routes, route, savedAt) {
+  var routeRef = Number(route && route.routeRef || 0);
+  var line = String(route && route.line || '');
+  Object.keys(routes).forEach(function(key) {
+    var existing = routes[key];
+    var sameIdentity = routeRef ? Number(existing.routeRef || 0) === routeRef :
+      !Number(existing.routeRef || 0) && String(existing.line || '') === line;
+    if (sameIdentity && Number(existing.savedAt || 0) < savedAt) delete routes[key];
+  });
 }
 
 function putRoute(storage, route, savedAt) {
   if (!route || !route.stops || !route.stops.length) return readSnapshot(storage);
   var snapshot = copy(readSnapshot(storage));
+  var routeSavedAt = Number(savedAt || Date.now());
   var storedRoute = {
-    savedAt: Number(savedAt || Date.now()),
+    savedAt: routeSavedAt,
+    rideId: Number(route.rideId || 0),
     routeRef: Number(route.routeRef || 0),
     line: String(route.line || ''),
+    direction: Number(route.direction || 0),
+    alternative: String(route.alternative || ''),
     stops: route.stops
   };
+  removeOlderRoutePatterns(snapshot.routes, storedRoute, routeSavedAt);
   snapshot.routes[routeKey(storedRoute)] = storedRoute;
   snapshot.routes = trimOldestEntries(snapshot.routes, MAX_ROUTES);
   return writeSnapshot(storage, snapshot);
@@ -180,17 +206,25 @@ function routeContainsStop(route, code) {
 
 function getRoute(storage, routeRef, code, line) {
   var snapshot = readSnapshot(storage);
-  var route = snapshot.routes['ref:' + Number(routeRef || 0)] || null;
-  if (!route) {
-    Object.keys(snapshot.routes).some(function(key) {
-      var candidate = snapshot.routes[key];
-      if (line && String(candidate.line) !== String(line)) return false;
-      if (!routeContainsStop(candidate, code)) return false;
-      route = candidate;
-      return true;
-    });
-  }
-  if (!route || !routeContainsStop(route, code)) return null;
+  var requestedRef = Number(routeRef || 0);
+  var candidates = [];
+  var newestSavedAt = 0;
+  Object.keys(snapshot.routes).forEach(function(key) {
+    var candidate = snapshot.routes[key];
+    if (requestedRef && Number(candidate.routeRef || 0) !== requestedRef) return;
+    if (!requestedRef && line && String(candidate.line) !== String(line)) return;
+    var savedAt = Number(candidate.savedAt || 0);
+    newestSavedAt = Math.max(newestSavedAt, savedAt);
+    candidates.push(candidate);
+  });
+  var route = null;
+  candidates.some(function(candidate) {
+    if (Number(candidate.savedAt || 0) !== newestSavedAt) return false;
+    if (!routeContainsStop(candidate, code)) return false;
+    route = candidate;
+    return true;
+  });
+  if (!route) return null;
   var currentIndex = -1;
   route.stops.some(function(stop, index) {
     if (stopCode(stop) !== Number(code)) return false;
@@ -198,8 +232,11 @@ function getRoute(storage, routeRef, code, line) {
     return true;
   });
   return {
+    rideId: Number(route.rideId || 0),
     routeRef: Number(route.routeRef || routeRef || 0),
     line: route.line,
+    direction: Number(route.direction || 0),
+    alternative: String(route.alternative || ''),
     stops: route.stops,
     currentIndex: currentIndex
   };
@@ -258,9 +295,13 @@ function favoriteRouteCandidates(snapshot, favoriteLines) {
 
 function mergeLatest(next, latest) {
   next.stations = uniqueStops(latest.stations.concat(next.stations), MAX_STATIONS);
-  Object.keys(latest.routes).forEach(function(key) { next.routes[key] = latest.routes[key]; });
+  Object.keys(latest.routes).forEach(function(key) {
+    if (!next.routes[key] || Number(latest.routes[key].savedAt || 0) > Number(next.routes[key].savedAt || 0)) {
+      next.routes[key] = latest.routes[key];
+    }
+  });
   Object.keys(latest.schedules).forEach(function(key) {
-    if (!next.schedules[key] || latest.schedules[key].savedAt > next.schedules[key].savedAt) {
+    if (!next.schedules[key] || Number(latest.schedules[key].savedAt || 0) > Number(next.schedules[key].savedAt || 0)) {
       next.schedules[key] = latest.schedules[key];
     }
   });
@@ -285,6 +326,7 @@ function refreshDaily(storage, settings, loaders, now) {
     routes: copy(existing.routes)
   });
   var stopIndex = 0;
+  var routeFailures = 0;
 
   function loadNextSchedule() {
     if (stopIndex >= favoriteStops.length) return loadRoutes();
@@ -306,15 +348,23 @@ function refreshDaily(storage, settings, loaders, now) {
     routeCandidates = uniqueRouteCandidates(routeCandidates, MAX_DAILY_ROUTES);
     var routeIndex = 0;
     function loadNextRoute() {
-      if (routeIndex >= routeCandidates.length || !loaders.loadRoute) return finish();
+      if (routeIndex >= routeCandidates.length) return finish();
+      if (!loaders.loadRoute) {
+        routeFailures += routeCandidates.length - routeIndex;
+        return finish();
+      }
       var candidate = routeCandidates[routeIndex++];
       return Promise.resolve(loaders.loadRoute(candidate, refreshTime)).then(function(route) {
         if (route && route.stops && route.stops.length) {
           route.savedAt = refreshTime;
+          removeOlderRoutePatterns(next.routes, route, refreshTime);
           next.routes[routeKey(route)] = route;
+        } else {
+          routeFailures += 1;
         }
         return loadNextRoute();
       }, function() {
+        routeFailures += 1;
         return loadNextRoute();
       });
     }
@@ -323,8 +373,9 @@ function refreshDaily(storage, settings, loaders, now) {
 
   function finish() {
     mergeLatest(next, readSnapshot(storage));
-    next.status = 'ready';
-    next.lastError = null;
+    next.status = routeFailures ? 'partial' : 'ready';
+    next.expiresAt = routeFailures ? 0 : refreshTime + DAY_MS;
+    next.lastError = routeFailures ? 'route refresh incomplete (' + routeFailures + ')' : null;
     return writeSnapshot(storage, next);
   }
 

@@ -139,12 +139,105 @@ async function testFailedRefreshKeepsPreviousSnapshot() {
   assert.strictEqual(retained.stations[0].name, 'Old stop data');
 }
 
+async function testFreshRouteWinsConcurrentOldSnapshot() {
+  const storage = memoryStorage();
+  const now = 1000;
+  cache.putRoute(storage, {
+    routeRef: 2508,
+    line: '60',
+    stops: [{ code: 25702, name: 'Old Tel Aviv stop' }, { code: 26001, name: 'Old Ramat Gan stop' }]
+  }, 100);
+
+  const refreshed = await cache.refreshDaily(storage, {
+    favorite_stops: [{ code: 25702, name: 'Tel Aviv Origin' }],
+    favorite_lines: [{ line: '60', operator: 'Dan' }]
+  }, {
+    loadSchedule: async () => [{
+      gtfs_stop__code: 25702,
+      gtfs_route__route_short_name: '60',
+      gtfs_route__line_ref: 2508,
+      gtfs_ride_id: 6001
+    }],
+    loadRoute: async () => ({
+      routeRef: 2508,
+      line: '60',
+      stops: [{ code: 25702, name: 'New Tel Aviv stop' }, { code: 26001, name: 'New Ramat Gan stop' }]
+    })
+  }, now);
+
+  assert.strictEqual(refreshed.status, 'ready');
+  assert.strictEqual(cache.getRoute(storage, 2508, 25702, '60').stops[0].name, 'New Tel Aviv stop');
+}
+
+function testRouteVariantsStayDistinct() {
+  const storage = memoryStorage();
+  cache.putRoute(storage, {
+    routeRef: 2508,
+    line: '60',
+    stops: [{ code: 25702, name: 'Tel Aviv' }, { code: 26001, name: 'Ramat Gan' }]
+  }, 100);
+  cache.putRoute(storage, {
+    routeRef: 2508,
+    line: '60',
+    stops: [{ code: 25702, name: 'Tel Aviv' }, { code: 26002, name: 'Givatayim' }]
+  }, 100);
+
+  assert.strictEqual(Object.keys(cache.readSnapshot(storage).routes).length, 2);
+  assert.strictEqual(cache.getRoute(storage, 2508, 26001, '60').stops[1].name, 'Ramat Gan');
+  assert.strictEqual(cache.getRoute(storage, 2508, 26002, '60').stops[1].name, 'Givatayim');
+
+  cache.putRoute(storage, {
+    routeRef: 2508,
+    line: '60',
+    stops: [{ code: 25702, name: 'Updated Tel Aviv' }, { code: 26002, name: 'Updated Givatayim' }]
+  }, 200);
+  assert.strictEqual(Object.keys(cache.readSnapshot(storage).routes).length, 1);
+  assert.strictEqual(cache.getRoute(storage, 2508, 26001, '60'), null);
+  assert.strictEqual(cache.getRoute(storage, 2508, 26002, '60').stops[0].name, 'Updated Tel Aviv');
+}
+
+async function testIncompleteRouteRefreshRetries() {
+  const storage = memoryStorage();
+  let routeLoads = 0;
+  const settings = {
+    favorite_stops: [{ code: 25702, name: 'Tel Aviv Origin' }],
+    favorite_lines: [{ line: '60', operator: 'Dan' }]
+  };
+  const loaders = {
+    loadSchedule: async () => [{
+      gtfs_stop__code: 25702,
+      gtfs_route__route_short_name: '60',
+      gtfs_route__line_ref: 2508,
+      gtfs_ride_id: 6001
+    }],
+    loadRoute: async () => {
+      routeLoads += 1;
+      if (routeLoads === 1) return null;
+      return {
+        routeRef: 2508,
+        line: '60',
+        stops: [{ code: 25702, name: 'Tel Aviv' }, { code: 26001, name: 'Ramat Gan' }]
+      };
+    }
+  };
+
+  const partial = await cache.refreshDaily(storage, settings, loaders, 1000);
+  assert.strictEqual(partial.status, 'partial');
+  assert.strictEqual(partial.expiresAt, 0);
+  const ready = await cache.refreshDaily(storage, settings, loaders, 2000);
+  assert.strictEqual(ready.status, 'ready');
+  assert.strictEqual(routeLoads, 2);
+}
+
 async function main() {
   await testDailyRefreshIsAtomicAndRunsOnce();
   testLearnedRoutesAndVisitedStopsSurviveRefresh();
   testFailedWriteKeepsPreviousSnapshot();
   testLegacyCitySnapshotMigratesOnlyRelevantData();
   await testFailedRefreshKeepsPreviousSnapshot();
+  await testFreshRouteWinsConcurrentOldSnapshot();
+  testRouteVariantsStayDistinct();
+  await testIncompleteRouteRefreshRetries();
   console.log('transit cache tests passed');
 }
 
